@@ -16,6 +16,11 @@ from openpyxl import Workbook
 st.set_page_config(page_title="Minimax Izvod", page_icon="🏦", layout="wide")
 
 # ========================================================================
+# LOAD API KEY FIRST (before password check)
+# ========================================================================
+API_KEY = st.secrets.get("ANTHROPIC_API_KEY", "")
+
+# ========================================================================
 # PASSWORD PROTECTION
 # ========================================================================
 if 'authenticated' not in st.session_state:
@@ -58,9 +63,6 @@ st.markdown("""<style>
 # Title
 st.markdown('<h1 class="main-title">🏦 Minimax Izvod Konvertor</h1>', unsafe_allow_html=True)
 st.markdown('<p class="subtitle">PDF izvodi → Excel sa razbijenim BEX kupcima</p>', unsafe_allow_html=True)
-
-# API Key
-API_KEY = st.secrets.get("ANTHROPIC_API_KEY", "")
 
 # DEBUG: Show if key is loaded (hide actual key)
 if API_KEY:
@@ -140,13 +142,10 @@ def parse_bex_specification(text):
 
 def parse_with_claude(text, filename):
     """Parse izvod using Claude API."""
-    # Ensure API_KEY is accessible
-    api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    if not API_KEY:
+        raise ValueError("ANTHROPIC_API_KEY nije konfigurisan!")
     
-    if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY nije konfigurisan u Streamlit Secrets!")
-    
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(api_key=API_KEY)
     
     prompt = f"""Analiziraj izvod banke i izvuci podatke u JSON formatu.
 
