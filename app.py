@@ -140,7 +140,13 @@ def parse_bex_specification(text):
 
 def parse_with_claude(text, filename):
     """Parse izvod using Claude API."""
-    client = anthropic.Anthropic(api_key=API_KEY)
+    # Ensure API_KEY is accessible
+    api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY nije konfigurisan u Streamlit Secrets!")
+    
+    client = anthropic.Anthropic(api_key=api_key)
     
     prompt = f"""Analiziraj izvod banke i izvuci podatke u JSON formatu.
 
