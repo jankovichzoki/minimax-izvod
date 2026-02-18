@@ -62,6 +62,13 @@ st.markdown('<p class="subtitle">PDF izvodi → Excel sa razbijenim BEX kupcima<
 # API Key
 API_KEY = st.secrets.get("ANTHROPIC_API_KEY", "")
 
+# DEBUG: Show if key is loaded (hide actual key)
+if API_KEY:
+    st.sidebar.success(f"✅ API key učitan ({len(API_KEY)} karaktera)")
+else:
+    st.sidebar.error("❌ API key NIJE učitan!")
+    st.sidebar.info("Proveri Streamlit Secrets: ANTHROPIC_API_KEY")
+
 # Helper functions
 def extract_text_from_pdf(pdf_bytes):
     """Extract text from PDF (supports both regular PDF and ZIP format)."""
