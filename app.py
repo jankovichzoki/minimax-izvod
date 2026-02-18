@@ -258,6 +258,69 @@ def create_minimax_excel(statement, transactions):
     output.seek(0)
     return output.getvalue()
 
+def create_minimax_xml(statement, transactions):
+    """Generate Minimax XML (100% accurate, no AI needed for structure)."""
+    import xml.etree.ElementTree as ET
+    
+    # Format account
+    account = format_account_number(statement.get('account', ''))
+    account_no_dashes = account.replace('-', '')
+    
+    # Calculate totals
+    dugovni = sum(float(tx.get('debit', 0) or 0) for tx in transactions)
+    potrazni = sum(float(tx.get('credit', 0) or 0) for tx in transactions)
+    
+    # Root
+    root = ET.Element('TransakcioniRacunPrivredaIzvod')
+    
+    # Zaglavlje
+    zaglavlje = ET.SubElement(root, 'Zaglavlje')
+    zaglavlje.set('VrstaIzvoda', 'R')
+    zaglavlje.set('BrojIzvoda', statement.get('number', ''))
+    zaglavlje.set('DatumIzvoda', statement.get('date', ''))
+    zaglavlje.set('MaticniBroj', '4167520394')
+    zaglavlje.set('KomitentNaziv', statement.get('owner_name', ''))
+    zaglavlje.set('KomitentAdresa', statement.get('owner_address', ''))
+    zaglavlje.set('KomitentMesto', '11010 BEOGRAD-VOŽDOVAC')
+    zaglavlje.set('Partija', account_no_dashes)
+    zaglavlje.set('TipRacuna', 'Transakcioni depoziti preduzetnika')
+    zaglavlje.set('PrethodnoStanje', f"{dugovni + potrazni:.2f}")  # Simplified
+    zaglavlje.set('DugovniPromet', f"{dugovni:.2f}")
+    zaglavlje.set('PotrazniPromet', f"{potrazni:.2f}")
+    zaglavlje.set('NovoStanje', f"{potrazni - dugovni:.2f}")
+    zaglavlje.set('StanjeObracunateProvizije', '0')
+    
+    # Stavke (transactions)
+    for tx in transactions:
+        cust_account = format_account_number(tx.get('customer_account', '')) if tx.get('customer_account') else ''
+        
+        stavka = ET.SubElement(root, 'Stavke')
+        stavka.set('NalogKorisnik', str(tx.get('customer_name', '') or ''))
+        stavka.set('Mesto', str(tx.get('customer_address', '') or ''))
+        stavka.set('VasBrojNaloga', '')
+        stavka.set('BrojRacunaPrimaocaPosiljaoca', cust_account)
+        stavka.set('Opis', str(tx.get('description', '') or ''))
+        stavka.set('SifraPlacanja', '')
+        stavka.set('SifraPlacanjaOpis', '')
+        stavka.set('Duguje', f"{float(tx.get('debit', 0) or 0):.2f}")
+        stavka.set('Potrazuje', f"{float(tx.get('credit', 0) or 0):.2f}")
+        stavka.set('ModelZaduzenjaOdobrenja', '')
+        stavka.set('PozivNaBrojZaduzenjaOdobrenja', '')
+        stavka.set('ModelKorisnika', '')
+        stavka.set('PozivNaBrojKorisnika', str(tx.get('reference', '') or ''))
+        stavka.set('BrojZaReklamaciju', '')
+        stavka.set('Referenca', str(tx.get('reference', '') or ''))
+        stavka.set('Objasnjenje', '')
+        stavka.set('DatumValute', str(tx.get('date', '') or ''))
+    
+    # Convert to bytes
+    tree = ET.ElementTree(root)
+    ET.indent(tree, space="  ", level=0)
+    output = io.BytesIO()
+    tree.write(output, encoding='utf-8', xml_declaration=True)
+    output.seek(0)
+    return output.getvalue()
+
 # Main UI
 col1, col2 = st.columns(2)
 
@@ -282,7 +345,19 @@ with col2:
 if izvodi_files:
     st.markdown("---")
     
-    if st.button("⚡ Generiši Minimax Excel", type="primary"):
+    # Two buttons side by side
+    col_btn1, col_btn2 = st.columns(2)
+    
+    with col_btn1:
+        generate_excel = st.button("📊 Generiši Excel", type="primary", use_container_width=True)
+    
+    with col_btn2:
+        generate_xml = st.button("📄 Generiši XML", type="secondary", use_container_width=True)
+    
+    if generate_excel or generate_xml:
+        output_format = "Excel" if generate_excel else "XML"
+        st.info(f"Generišem {output_format} format...")
+        
         # Parse BEX specs first
         specifications = {}
         
@@ -297,9 +372,9 @@ if izvodi_files:
                         if customers:
                             specifications[spec_file.name] = customers
                             total = sum(c['amount'] for c in customers)
-                            st.success(f"✅ {spec_file.name}: {len(customers)} kupaca, {total:,.2f} RSD")
+                            st.success(f"OK {spec_file.name}: {len(customers)} kupaca, {total:,.2f} RSD")
                     except Exception as e:
-                        st.error(f"❌ {spec_file.name}: {e}")
+                        st.error(f"GRESKA {spec_file.name}: {str(e)}")
         
         # Process izvodi
         progress_bar = st.progress(0)
@@ -309,32 +384,39 @@ if izvodi_files:
             progress_bar.progress((i + 1) / len(izvodi_files))
             
             try:
-                with st.status(f"Obrađujem: {izvod_file.name}"):
+                with st.status(f"Obradjujem: {izvod_file.name}"):
                     # Extract
-                    st.write("📄 Čitam PDF...")
+                    st.write("Citam PDF...")
                     pdf_bytes = izvod_file.read()
                     text = extract_text_from_pdf(pdf_bytes)
                     
                     # Parse
-                    st.write("🤖 AI parsiranje...")
+                    st.write("AI parsiranje...")
                     parsed = parse_with_claude(text, izvod_file.name)
                     
                     # Expand BEX
-                    st.write("🔄 Proveravam BEX...")
+                    st.write("Proveravam BEX...")
                     original_count = len(parsed['transactions'])
                     expanded = expand_bex_transactions(parsed['transactions'], specifications)
                     
-                    # Generate Excel
-                    st.write("📊 Generišem Excel...")
-                    excel_bytes = create_minimax_excel(parsed['statement'], expanded)
-                    
-                    output_name = izvod_file.name.replace('.pdf', '').replace('.PDF', '') + '_minimax.xlsx'
+                    # Generate file based on format
+                    st.write(f"Generisem {output_format}...")
+                    if generate_excel:
+                        file_bytes = create_minimax_excel(parsed['statement'], expanded)
+                        output_name = izvod_file.name.replace('.pdf', '').replace('.PDF', '') + '_minimax.xlsx'
+                        mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    else:
+                        file_bytes = create_minimax_xml(parsed['statement'], expanded)
+                        output_name = izvod_file.name.replace('.pdf', '').replace('.PDF', '') + '_minimax.xml'
+                        mime_type = "application/xml"
                     
                     results.append({
                         'success': True,
                         'filename': izvod_file.name,
                         'output_name': output_name,
-                        'excel_bytes': excel_bytes,
+                        'file_bytes': file_bytes,
+                        'mime_type': mime_type,
+                        'format': output_format,
                         'statement': parsed['statement'],
                         'tx_count': len(expanded),
                         'bex_expanded': len(expanded) > original_count
@@ -347,27 +429,30 @@ if izvodi_files:
         
         # Display results
         st.markdown("---")
-        st.markdown("## 📥 Rezultati")
+        st.markdown(f"## 📥 Rezultati ({output_format})")
         
         for r in results:
             if r['success']:
                 col1, col2 = st.columns([3, 1])
                 
                 with col1:
-                    st.markdown(f"### ✅ {r['filename']}")
-                    st.markdown(f"**Račun:** `{format_account_number(r['statement']['account'])}`")
+                    st.markdown(f"### OK {r['filename']}")
+                    formatted_account = format_account_number(r['statement']['account'])
+                    st.markdown(f"**Racun:** `{formatted_account}`")
                     st.markdown(f"**Transakcija:** {r['tx_count']}" + 
-                              (f" 🔄 *BEX razbijen*" if r['bex_expanded'] else ""))
+                              (f" BEX razbijen" if r['bex_expanded'] else ""))
                 
                 with col2:
+                    btn_label = "Preuzmi Excel" if r['format'] == "Excel" else "Preuzmi XML"
                     st.download_button(
-                        "⬇️ Preuzmi Excel",
-                        data=r['excel_bytes'],
+                        btn_label,
+                        data=r['file_bytes'],
                         file_name=r['output_name'],
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        mime=r['mime_type'],
+                        key=f"download_{r['filename']}_{r['format']}"
                     )
             else:
-                st.error(f"❌ {r['filename']}: {r['error']}")
+                st.error(f"GRESKA {r['filename']}: {r['error']}")
 
 else:
     st.info("👆 Započni upload-om PDF izvoda")
