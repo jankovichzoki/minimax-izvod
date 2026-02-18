@@ -62,15 +62,13 @@ def format_account_number(account_str):
     # If exactly 18 digits, format as 3-13-2
     if len(digits) == 18:
         formatted = f"{digits[:3]}-{digits[3:16]}-{digits[16:]}"
-        st.info(f"📝 Formatiran račun: {account_str} → {formatted}")
         return formatted
     
     # If already has dashes in correct format, keep as is
     if re.match(r'^\d{3}-\d{13}-\d{2}$', str(account_str)):
         return str(account_str)
     
-    # Otherwise return as-is and warn
-    st.warning(f"⚠️ Račun {account_str} ne može biti automatski formatiran (nije 18 cifara)")
+    # Otherwise return as-is
     return str(account_str)
 
 def parse_bex_specification(text):
@@ -185,20 +183,35 @@ def expand_bex_transactions(transactions, specifications):
     """Expand BEX transactions using specifications."""
     expanded = []
     
+    # DEBUG: Show what we have
+    if specifications:
+        st.info(f"🔍 Učitano specifikacija: {len(specifications)}")
+        for spec_name, customers in specifications.items():
+            spec_total = sum(c['amount'] for c in customers)
+            st.write(f"   → {spec_name}: {len(customers)} kupaca = {spec_total:,.2f} RSD")
+    else:
+        st.warning("⚠️ Nema učitanih BEX specifikacija!")
+    
     for tx in transactions:
-        is_bex = 'BEX' in (tx.get('customer_name', '') or '').upper()
+        customer_name = tx.get('customer_name', '') or ''
+        is_bex = 'BEX' in customer_name.upper()
         
         if is_bex:
             tx_amount = tx.get('credit', 0) or tx.get('debit', 0)
+            st.info(f"🔍 Pronađena BEX transakcija: '{customer_name}' = {tx_amount:,.2f} RSD")
             
             # Find matching spec
             matched = None
-            for spec_name, customers in specifications.items():
-                spec_total = sum(c['amount'] for c in customers)
-                if abs(spec_total - tx_amount) < 0.01:
-                    matched = customers
-                    st.success(f"🔄 Razbijam BEX: {len(customers)} kupaca")
-                    break
+            if specifications:
+                for spec_name, customers in specifications.items():
+                    spec_total = sum(c['amount'] for c in customers)
+                    diff = abs(spec_total - tx_amount)
+                    st.write(f"   Poređenje: spec={spec_total:,.2f} vs tx={tx_amount:,.2f}, razlika={diff:.4f}")
+                    
+                    if diff < 0.01:
+                        matched = customers
+                        st.success(f"✅ MATCH! Razbijam na {len(customers)} kupaca")
+                        break
             
             if matched:
                 for c in matched:
@@ -215,18 +228,21 @@ def expand_bex_transactions(transactions, specifications):
                         'description': f"Otkup pošiljke {c['posiljka']}"
                     })
             else:
+                st.error(f"❌ BEX transakcija NEMA matching specifikaciju! (Iznos: {tx_amount:,.2f})")
                 expanded.append(tx)
         else:
             expanded.append(tx)
     
+    st.info(f"📊 Rezultat: {len(transactions)} → {len(expanded)} transakcija")
     return expanded
 
 def create_minimax_excel(statement, transactions):
     """Generate Minimax Excel with correct formatting."""
     wb = Workbook()
     
-    # Format account number - CRITICAL!
+    # Format account number
     account = format_account_number(statement.get('account', ''))
+    st.success(f"✅ Račun formatiran: {account}")
     
     # Sheet 1: Statement
     ws1 = wb.active
@@ -314,88 +330,23 @@ if izvodi_files:
         specifications = {}
         
         if spec_files:
-            with st.spinner("Parsiram BEX specifikacije..."):
-                for spec_file in spec_files:
-                    try:
-                        spec_bytes = spec_file.read()
-                        spec_text = extract_text_from_pdf(spec_bytes)
-                        customers = parse_bex_specification(spec_text)
+            st.markdown("### 📋 Parsiranje BEX specifikacija")
+            for spec_file in spec_files:
+                try:
+                    spec_bytes = spec_file.read()
+                    spec_text = extract_text_from_pdf(spec_bytes)
+                    customers = parse_bex_specification(spec_text)
+                    
+                    if customers:
+                        specifications[spec_file.name] = customers
+                        total = sum(c['amount'] for c in customers)
+                        st.success(f"✅ {spec_file.name}: {len(customers)} kupaca, {total:,.2f} RSD")
                         
-                        if customers:
-                            specifications[spec_file.name] = customers
-                            total = sum(c['amount'] for c in customers)
-                            st.success(f"✅ {spec_file.name}: {len(customers)} kupaca, {total:,.2f} RSD")
-                    except Exception as e:
-                        st.error(f"❌ {spec_file.name}: {e}")
-        
-        # Process izvodi
-        progress_bar = st.progress(0)
-        results = []
-        
-        for i, izvod_file in enumerate(izvodi_files):
-            progress_bar.progress((i + 1) / len(izvodi_files))
-            
-            try:
-                with st.status(f"Obrađujem: {izvod_file.name}"):
-                    # Extract
-                    st.write("📄 Čitam PDF...")
-                    pdf_bytes = izvod_file.read()
-                    text = extract_text_from_pdf(pdf_bytes)
-                    
-                    # Parse
-                    st.write("🤖 AI parsiranje...")
-                    parsed = parse_with_claude(text, izvod_file.name)
-                    
-                    # Expand BEX
-                    st.write("🔄 Proveravam BEX...")
-                    original_count = len(parsed['transactions'])
-                    expanded = expand_bex_transactions(parsed['transactions'], specifications)
-                    
-                    # Generate Excel
-                    st.write("📊 Generišem Excel...")
-                    excel_bytes = create_minimax_excel(parsed['statement'], expanded)
-                    
-                    output_name = izvod_file.name.replace('.pdf', '').replace('.PDF', '') + '_minimax.xlsx'
-                    
-                    results.append({
-                        'success': True,
-                        'filename': izvod_file.name,
-                        'output_name': output_name,
-                        'excel_bytes': excel_bytes,
-                        'statement': parsed['statement'],
-                        'tx_count': len(expanded),
-                        'bex_expanded': len(expanded) > original_count
-                    })
-                    
-            except Exception as e:
-                results.append({'success': False, 'filename': izvod_file.name, 'error': str(e)})
-        
-        progress_bar.empty()
-        
-        # Display results
-        st.markdown("---")
-        st.markdown("## 📥 Rezultati")
-        
-        for r in results:
-            if r['success']:
-                col1, col2 = st.columns([3, 1])
-                
-                with col1:
-                    st.markdown(f"### ✅ {r['filename']}")
-                    formatted_account = format_account_number(r['statement']['account'])
-                    st.markdown(f"**Račun:** `{formatted_account}`")
-                    st.markdown(f"**Transakcija:** {r['tx_count']}" + 
-                              (f" 🔄 *BEX razbijen*" if r['bex_expanded'] else ""))
-                
-                with col2:
-                    st.download_button(
-                        "⬇️ Preuzmi Excel",
-                        data=r['excel_bytes'],
-                        file_name=r['output_name'],
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-            else:
-                st.error(f"❌ {r['filename']}: {r['error']}")
-
-else:
-    st.info("👆 Započni upload-om PDF izvoda")
+                        # Show details
+                        with st.expander(f"Detalji: {spec_file.name}"):
+                            for c in customers:
+                                st.write(f"  • {c['name']}: {c['amount']:,.2f} RSD")
+                    else:
+                        st.warning(f"⚠️ {spec_file.name}: Nisu pronađeni kupci")
+                except Exception as e:
+                    st.error(f"❌ {spec_file.name}: {e}
