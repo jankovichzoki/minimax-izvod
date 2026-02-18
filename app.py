@@ -52,18 +52,25 @@ def extract_text_from_pdf(pdf_bytes):
         return pdf_bytes.decode('utf-8', errors='replace')
 
 def format_account_number(account_str):
-    """Format account to XXX-XXXXXXXXXXXXX-XX if needed."""
+    """Format account to XXX-XXXXXXXXXXXXX-XX (3-13-2) if needed."""
+    if not account_str:
+        return ""
+    
     # Remove all non-digits
     digits = re.sub(r'\D', '', str(account_str))
     
-    # If 18 digits, format as 3-13-2
+    # If exactly 18 digits, format as 3-13-2
     if len(digits) == 18:
-        return f"{digits[:3]}-{digits[3:16]}-{digits[16:]}"
+        formatted = f"{digits[:3]}-{digits[3:16]}-{digits[16:]}"
+        st.info(f"📝 Formatiran račun: {account_str} → {formatted}")
+        return formatted
     
-    # If already has dashes, keep as is
-    if '-' in str(account_str):
+    # If already has dashes in correct format, keep as is
+    if re.match(r'^\d{3}-\d{13}-\d{2}$', str(account_str)):
         return str(account_str)
     
+    # Otherwise return as-is and warn
+    st.warning(f"⚠️ Račun {account_str} ne može biti automatski formatiran (nije 18 cifara)")
     return str(account_str)
 
 def parse_bex_specification(text):
@@ -133,7 +140,7 @@ Vrati SAMO JSON (bez markdown):
 {{
   "statement": {{
     "date": "DD.MM.YYYY",
-    "account": "broj-racuna-SA-SVIM-NULAMA-bez-crtica",
+    "account": "broj-racuna-SA-SVIM-NULAMA-BEZ-crtica-samo-18-cifara",
     "number": "broj_izvoda",
     "owner_name": "ime vlasnika",
     "owner_address": "adresa",
@@ -144,7 +151,7 @@ Vrati SAMO JSON (bez markdown):
       "date": "DD.MM.YYYY",
       "customer_name": "naziv",
       "customer_address": "adresa",
-      "customer_account": "racun-bez-crtica",
+      "customer_account": "racun-BEZ-crtica-samo-cifre",
       "customer_tax_number": "",
       "reference": "referenca",
       "currency": "RSD",
@@ -155,13 +162,14 @@ Vrati SAMO JSON (bez markdown):
   ]
 }}
 
-PRAVILA:
+KRITIČNA PRAVILA:
 - debit = IZLAZI (pozitivan, credit=0)
 - credit = ULAZI (pozitivan, debit=0)
-- Račune vrati BEZ crtica (samo cifre)
+- Račune vrati BEZ crtica, samo cifre (18 cifara)
 - NIKAD ne skraćuj nule u brojevima
 - date format: DD.MM.YYYY
-- Ignoriši ukupne sume"""
+- Ignoriši ukupne sume
+- Za račune u izvodu - vrati SVE cifre bez crtica"""
     
     msg = client.messages.create(
         model="claude-sonnet-4-20250514",
@@ -217,7 +225,7 @@ def create_minimax_excel(statement, transactions):
     """Generate Minimax Excel with correct formatting."""
     wb = Workbook()
     
-    # Format account number
+    # Format account number - CRITICAL!
     account = format_account_number(statement.get('account', ''))
     
     # Sheet 1: Statement
@@ -374,7 +382,8 @@ if izvodi_files:
                 
                 with col1:
                     st.markdown(f"### ✅ {r['filename']}")
-                    st.markdown(f"**Račun:** `{format_account_number(r['statement']['account'])}`")
+                    formatted_account = format_account_number(r['statement']['account'])
+                    st.markdown(f"**Račun:** `{formatted_account}`")
                     st.markdown(f"**Transakcija:** {r['tx_count']}" + 
                               (f" 🔄 *BEX razbijen*" if r['bex_expanded'] else ""))
                 
