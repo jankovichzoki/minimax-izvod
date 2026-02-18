@@ -183,8 +183,8 @@ def expand_bex_transactions(transactions, specifications):
                         'customer_tax_number': '',
                         'reference': c['reference'],
                         'currency': 'RSD',
-                        'debit': c['amount'] if tx.get('debit', 0) > 0 else 0,
-                        'credit': c['amount'] if tx.get('credit', 0) > 0 else 0,
+                        'debit': 0,  # BEX customers are always CREDIT (income)
+                        'credit': c['amount'],
                         'description': f"Otkup pošiljke {c['posiljka']}"
                     })
             else:
@@ -193,6 +193,58 @@ def expand_bex_transactions(transactions, specifications):
             expanded.append(tx)
     
     return expanded
+
+def fix_debit_credit_logic(transactions, owner_account):
+    """
+    Fix debit/credit based on logic:
+    - If customer_account matches owner_account → CREDIT (money IN)
+    - If customer_account is different/empty → DEBIT (money OUT)
+    - If customer_name contains owner name → CREDIT (internal transfer)
+    """
+    owner_account_clean = owner_account.replace('-', '')
+    fixed = []
+    
+    for tx in transactions:
+        cust_account = (tx.get('customer_account', '') or '').replace('-', '')
+        cust_name = (tx.get('customer_name', '') or '').upper()
+        
+        # Check if this is incoming or outgoing
+        is_incoming = False
+        
+        # Rule 1: BEX customers are always incoming
+        if 'ŠABLJOV' in cust_name or 'SEKE' in cust_name or 'PAVLOVIĆ' in cust_name or 'WS-MM-' in tx.get('reference', ''):
+            is_incoming = True
+        
+        # Rule 2: Account matches owner = incoming
+        elif cust_account and cust_account == owner_account_clean:
+            is_incoming = True
+        
+        # Rule 3: Name contains "MG AUTO" or owner name = internal/outgoing
+        elif 'MG AUTO' in cust_name or 'MLADEN GRUJOSKI' in cust_name:
+            is_incoming = False
+        
+        # Rule 4: Banks, taxes, suppliers = outgoing
+        elif any(x in cust_name for x in ['RAIFFEISEN', 'PORESKA', 'GBG', 'BIZ KONCEPT', 'BOŽIDAR']):
+            is_incoming = False
+        
+        # Rule 5: If both debit and credit are set, keep as is
+        elif tx.get('debit', 0) > 0 and tx.get('credit', 0) > 0:
+            fixed.append(tx)
+            continue
+        
+        # Apply fix
+        amount = tx.get('credit', 0) or tx.get('debit', 0)
+        
+        if is_incoming:
+            tx['debit'] = 0
+            tx['credit'] = amount
+        else:
+            tx['debit'] = amount
+            tx['credit'] = 0
+        
+        fixed.append(tx)
+    
+    return fixed
 
 def create_minimax_excel(statement, transactions):
     """Generate Minimax Excel with correct formatting."""
@@ -398,6 +450,10 @@ if izvodi_files:
                     st.write("Proveravam BEX...")
                     original_count = len(parsed['transactions'])
                     expanded = expand_bex_transactions(parsed['transactions'], specifications)
+                    
+                    # Fix debit/credit logic
+                    st.write("Proveravam debit/credit...")
+                    expanded = fix_debit_credit_logic(expanded, parsed['statement'].get('account', ''))
                     
                     # Generate file based on format
                     st.write(f"Generisem {output_format}...")
