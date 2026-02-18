@@ -16,41 +16,12 @@ from openpyxl import Workbook
 st.set_page_config(page_title="Minimax Izvod", page_icon="🏦", layout="wide")
 
 # ========================================================================
-# LOAD API KEY FIRST (before password check)
+# LOAD API KEY FIRST
 # ========================================================================
 API_KEY = st.secrets.get("ANTHROPIC_API_KEY", "")
 
 # ========================================================================
-# PASSWORD PROTECTION
-# ========================================================================
-if 'authenticated' not in st.session_state:
-    st.session_state.authenticated = False
-
-if not st.session_state.authenticated:
-    st.markdown("# 🔒 Minimax Izvod - Pristup zaštićen")
-    st.markdown("Unesi lozinku za pristup aplikaciji:")
-    
-    password = st.text_input("Lozinka:", type="password", key="password_input")
-    
-    col1, col2, col3 = st.columns([1, 1, 2])
-    with col1:
-        if st.button("🔓 Prijavi se", type="primary"):
-            # Get password from secrets
-            correct_password = st.secrets.get("APP_PASSWORD", "minimax2026")
-            
-            if password == correct_password:
-                st.session_state.authenticated = True
-                st.success("✅ Uspešna prijava!")
-                st.rerun()
-            else:
-                st.error("❌ Pogrešna lozinka!")
-    
-    st.markdown("---")
-    st.info("💡 Kontaktiraj administratora za pristup.")
-    st.stop()
-
-# ========================================================================
-# MAIN APP (only accessible after authentication)
+# MAIN APP
 # ========================================================================
 
 # Custom CSS
