@@ -185,12 +185,12 @@ def expand_bex_transactions(transactions, specifications):
     
     # DEBUG: Show what we have
     if specifications:
-        st.info(f"🔍 Učitano specifikacija: {len(specifications)}")
+        st.info(f"DEBUG: Ucitano specifikacija: {len(specifications)}")
         for spec_name, customers in specifications.items():
             spec_total = sum(c['amount'] for c in customers)
-            st.write(f"   → {spec_name}: {len(customers)} kupaca = {spec_total:,.2f} RSD")
+            st.write(f"-> {spec_name}: {len(customers)} kupaca = {spec_total:,.2f} RSD")
     else:
-        st.warning("⚠️ Nema učitanih BEX specifikacija!")
+        st.warning("UPOZORENJE: Nema ucitanih BEX specifikacija!")
     
     for tx in transactions:
         customer_name = tx.get('customer_name', '') or ''
@@ -198,7 +198,7 @@ def expand_bex_transactions(transactions, specifications):
         
         if is_bex:
             tx_amount = tx.get('credit', 0) or tx.get('debit', 0)
-            st.info(f"🔍 Pronađena BEX transakcija: '{customer_name}' = {tx_amount:,.2f} RSD")
+            st.info(f"DEBUG: Pronadjena BEX transakcija: '{customer_name}' = {tx_amount:,.2f} RSD")
             
             # Find matching spec
             matched = None
@@ -206,11 +206,11 @@ def expand_bex_transactions(transactions, specifications):
                 for spec_name, customers in specifications.items():
                     spec_total = sum(c['amount'] for c in customers)
                     diff = abs(spec_total - tx_amount)
-                    st.write(f"   Poređenje: spec={spec_total:,.2f} vs tx={tx_amount:,.2f}, razlika={diff:.4f}")
+                    st.write(f"Poredjenje: spec={spec_total:,.2f} vs tx={tx_amount:,.2f}, razlika={diff:.4f}")
                     
                     if diff < 0.01:
                         matched = customers
-                        st.success(f"✅ MATCH! Razbijam na {len(customers)} kupaca")
+                        st.success(f"MATCH! Razbijam na {len(customers)} kupaca")
                         break
             
             if matched:
@@ -228,12 +228,12 @@ def expand_bex_transactions(transactions, specifications):
                         'description': f"Otkup pošiljke {c['posiljka']}"
                     })
             else:
-                st.error(f"❌ BEX transakcija NEMA matching specifikaciju! (Iznos: {tx_amount:,.2f})")
+                st.error(f"BEX transakcija NEMA matching specifikaciju! (Iznos: {tx_amount:,.2f})")
                 expanded.append(tx)
         else:
             expanded.append(tx)
     
-    st.info(f"📊 Rezultat: {len(transactions)} → {len(expanded)} transakcija")
+    st.info(f"Rezultat: {len(transactions)} -> {len(expanded)} transakcija")
     return expanded
 
 def create_minimax_excel(statement, transactions):
@@ -242,7 +242,7 @@ def create_minimax_excel(statement, transactions):
     
     # Format account number
     account = format_account_number(statement.get('account', ''))
-    st.success(f"✅ Račun formatiran: {account}")
+    st.success(f"Racun formatiran: {account}")
     
     # Sheet 1: Statement
     ws1 = wb.active
@@ -340,13 +340,91 @@ if izvodi_files:
                     if customers:
                         specifications[spec_file.name] = customers
                         total = sum(c['amount'] for c in customers)
-                        st.success(f"✅ {spec_file.name}: {len(customers)} kupaca, {total:,.2f} RSD")
+                        st.success(f"OK {spec_file.name}: {len(customers)} kupaca, {total:,.2f} RSD")
                         
                         # Show details
                         with st.expander(f"Detalji: {spec_file.name}"):
                             for c in customers:
                                 st.write(f"  • {c['name']}: {c['amount']:,.2f} RSD")
                     else:
-                        st.warning(f"⚠️ {spec_file.name}: Nisu pronađeni kupci")
+                        st.warning(f"UPOZORENJE {spec_file.name}: Nisu pronadjeni kupci")
                 except Exception as e:
-                    st.error(f"❌ {spec_file.name}: {e}
+                    st.error(f"GRESKA {spec_file.name}: {str(e)}")
+        
+        # Process izvodi
+        st.markdown("### 📄 Obrada izvoda")
+        progress_bar = st.progress(0)
+        results = []
+        
+        for i, izvod_file in enumerate(izvodi_files):
+            progress_bar.progress((i + 1) / len(izvodi_files))
+            
+            try:
+                with st.status(f"Obradjujem: {izvod_file.name}", expanded=True):
+                    # Extract
+                    st.write("Citam PDF...")
+                    pdf_bytes = izvod_file.read()
+                    text = extract_text_from_pdf(pdf_bytes)
+                    
+                    # Parse
+                    st.write("AI parsiranje...")
+                    parsed = parse_with_claude(text, izvod_file.name)
+                    
+                    # Show parsed data
+                    st.write(f"Parsiran izvod: {len(parsed['transactions'])} transakcija")
+                    
+                    # Expand BEX
+                    st.write("Proveravam BEX transakcije...")
+                    original_count = len(parsed['transactions'])
+                    expanded = expand_bex_transactions(parsed['transactions'], specifications)
+                    
+                    # Generate Excel
+                    st.write("Generisem Excel...")
+                    excel_bytes = create_minimax_excel(parsed['statement'], expanded)
+                    
+                    output_name = izvod_file.name.replace('.pdf', '').replace('.PDF', '') + '_minimax.xlsx'
+                    
+                    results.append({
+                        'success': True,
+                        'filename': izvod_file.name,
+                        'output_name': output_name,
+                        'excel_bytes': excel_bytes,
+                        'statement': parsed['statement'],
+                        'tx_count': len(expanded),
+                        'bex_expanded': len(expanded) > original_count
+                    })
+                    
+            except Exception as e:
+                st.error(f"Greska: {str(e)}")
+                results.append({'success': False, 'filename': izvod_file.name, 'error': str(e)})
+        
+        progress_bar.empty()
+        
+        # Display results
+        st.markdown("---")
+        st.markdown("## 📥 Rezultati")
+        
+        for r in results:
+            if r['success']:
+                col1, col2 = st.columns([3, 1])
+                
+                with col1:
+                    st.markdown(f"### ✅ {r['filename']}")
+                    formatted_account = format_account_number(r['statement']['account'])
+                    st.markdown(f"**Račun:** `{formatted_account}`")
+                    st.markdown(f"**Transakcija:** {r['tx_count']}" + 
+                              (f" BEX razbijen" if r['bex_expanded'] else ""))
+                
+                with col2:
+                    st.download_button(
+                        "Preuzmi Excel",
+                        data=r['excel_bytes'],
+                        file_name=r['output_name'],
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"download_{r['filename']}"
+                    )
+            else:
+                st.error(f"GRESKA {r['filename']}: {r['error']}")
+
+else:
+    st.info("Zapocni upload-om PDF izvoda")
