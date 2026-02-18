@@ -67,6 +67,9 @@ st.markdown('<p class="subtitle">PDF izvodi → Excel sa razbijenim BEX kupcima<
 # DEBUG: Show if key is loaded (hide actual key)
 if API_KEY:
     st.sidebar.success(f"✅ API key učitan ({len(API_KEY)} karaktera)")
+    # EXTREME DEBUG - show first/last chars
+    st.sidebar.code(f"Start: {API_KEY[:15]}...")
+    st.sidebar.code(f"...End: {API_KEY[-15:]}")
 else:
     st.sidebar.error("❌ API key NIJE učitan!")
     st.sidebar.info("Proveri Streamlit Secrets: ANTHROPIC_API_KEY")
