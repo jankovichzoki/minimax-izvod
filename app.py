@@ -21,7 +21,35 @@ st.set_page_config(page_title="Minimax Izvod", page_icon="🏦", layout="wide")
 API_KEY = st.secrets.get("ANTHROPIC_API_KEY", "")
 
 # ========================================================================
-# MAIN APP
+# PASSWORD PROTECTION
+# ========================================================================
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.markdown("# 🔒 Minimax Izvod - Pristup zaštićen")
+    st.markdown("Unesi lozinku za pristup aplikaciji:")
+    
+    password = st.text_input("Lozinka:", type="password", key="password_input")
+    
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        if st.button("🔓 Prijavi se", type="primary"):
+            correct_password = st.secrets.get("APP_PASSWORD", "minimax2026")
+            
+            if password == correct_password:
+                st.session_state.authenticated = True
+                st.success("✅ Uspešna prijava!")
+                st.rerun()
+            else:
+                st.error("❌ Pogrešna lozinka!")
+    
+    st.markdown("---")
+    st.info("💡 Kontaktiraj administratora za pristup.")
+    st.stop()
+
+# ========================================================================
+# MAIN APP (only accessible after authentication)
 # ========================================================================
 
 # Custom CSS
@@ -34,16 +62,6 @@ st.markdown("""<style>
 # Title
 st.markdown('<h1 class="main-title">🏦 Minimax Izvod Konvertor</h1>', unsafe_allow_html=True)
 st.markdown('<p class="subtitle">PDF izvodi → Excel sa razbijenim BEX kupcima</p>', unsafe_allow_html=True)
-
-# DEBUG: Show if key is loaded (hide actual key)
-if API_KEY:
-    st.sidebar.success(f"✅ API key učitan ({len(API_KEY)} karaktera)")
-    # EXTREME DEBUG - show first/last chars
-    st.sidebar.code(f"Start: {API_KEY[:15]}...")
-    st.sidebar.code(f"...End: {API_KEY[-15:]}")
-else:
-    st.sidebar.error("❌ API key NIJE učitan!")
-    st.sidebar.info("Proveri Streamlit Secrets: ANTHROPIC_API_KEY")
 
 # Helper functions
 def extract_text_from_pdf(pdf_bytes):
