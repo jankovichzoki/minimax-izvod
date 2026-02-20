@@ -85,6 +85,59 @@ def extract_text_from_pdf(pdf_bytes):
                 return text
         return pdf_bytes.decode('utf-8', errors='replace')
 
+def parse_xml_izvod(xml_bytes, filename):
+    """
+    Parse XML izvod (alternative to PDF izvod).
+    
+    Returns same format as parse_with_claude() for compatibility.
+    """
+    import xml.etree.ElementTree as ET
+    
+    try:
+        tree = ET.parse(io.BytesIO(xml_bytes))
+        root = tree.getroot()
+        
+        # Extract statement info from Zaglavlje
+        zaglavlje = root.find('Zaglavlje')
+        if zaglavlje is None:
+            raise ValueError("XML nema Zaglavlje element")
+        
+        statement = {
+            'date': zaglavlje.get('DatumIzvoda', ''),
+            'account': zaglavlje.get('Partija', ''),
+            'number': zaglavlje.get('BrojIzvoda', ''),
+            'owner_name': zaglavlje.get('KomitentNaziv', ''),
+            'owner_address': zaglavlje.get('KomitentAdresa', ''),
+            'tax_number': zaglavlje.get('MaticniBroj', '')
+        }
+        
+        # Extract transactions from Stavke elements
+        transactions = []
+        for stavka in root.findall('Stavke'):
+            debit = float(stavka.get('Duguje', '0') or '0')
+            credit = float(stavka.get('Potrazuje', '0') or '0')
+            
+            transactions.append({
+                'date': stavka.get('DatumValute', ''),
+                'customer_name': stavka.get('NalogKorisnik', ''),
+                'customer_address': stavka.get('Mesto', ''),
+                'customer_account': stavka.get('BrojRacunaPrimaocaPosiljaoca', ''),
+                'customer_tax_number': '',
+                'reference': stavka.get('PozivNaBrojKorisnika', '') or stavka.get('Referenca', ''),
+                'currency': 'RSD',
+                'debit': debit,
+                'credit': credit,
+                'description': stavka.get('Opis', '')
+            })
+        
+        return {
+            'statement': statement,
+            'transactions': transactions
+        }
+        
+    except Exception as e:
+        raise ValueError(f"XML parsing greška: {str(e)}")
+
 def format_account_number(account_str):
     """Format account to XXX-XXXXXXXXXXXXX-XX if needed."""
     # Remove all non-digits
@@ -329,9 +382,9 @@ def expand_bex_transactions(transactions, specifications):
 def fix_debit_credit_logic(transactions, owner_account):
     """
     Fix debit/credit based on logic:
-    - If customer_account matches owner_account → CREDIT (money IN)
-    - If customer_account is different/empty → DEBIT (money OUT)
-    - If customer_name contains owner name → CREDIT (internal transfer)
+    - BEX customers (income from courier) → CREDIT (money IN)
+    - Payments to suppliers/banks → DEBIT (money OUT)
+    - Transfers from own account → CREDIT (money IN)
     """
     owner_account_clean = owner_account.replace('-', '')
     fixed = []
@@ -339,27 +392,33 @@ def fix_debit_credit_logic(transactions, owner_account):
     for tx in transactions:
         cust_account = (tx.get('customer_account', '') or '').replace('-', '')
         cust_name = (tx.get('customer_name', '') or '').upper()
+        description = (tx.get('description', '') or '').upper()
         
         # Check if this is incoming or outgoing
         is_incoming = False
         
-        # Rule 1: BEX customers are always incoming
-        if 'ŠABLJOV' in cust_name or 'SEKE' in cust_name or 'PAVLOVIĆ' in cust_name or 'WS-MM-' in tx.get('reference', ''):
+        # CRITICAL RULE 1: BEX customers are ALWAYS incoming (we collected money)
+        # Indicators: customer names from BEX specs, or "OTKUP POŠILJKE" in description
+        if any(x in description for x in ['OTKUP', 'POŠILJKE', 'POSILJKE']):
+            is_incoming = True
+        elif any(x in cust_name for x in ['ŠABLJOV', 'SEKE', 'PAVLOVIĆ', 'MILEV', 'JOVANOVIĆ', 'MANOJLOVIĆ']):
+            is_incoming = True
+        elif 'OT-' in tx.get('reference', ''):  # BEX reference format
             is_incoming = True
         
-        # Rule 2: Account matches owner = incoming
+        # Rule 2: Account matches owner = incoming transfer
         elif cust_account and cust_account == owner_account_clean:
             is_incoming = True
         
-        # Rule 3: Name contains "MG AUTO" or owner name = internal/outgoing
+        # Rule 3: Company name in customer = internal/outgoing
         elif 'MG AUTO' in cust_name or 'MLADEN GRUJOSKI' in cust_name:
             is_incoming = False
         
-        # Rule 4: Banks, taxes, suppliers = outgoing
-        elif any(x in cust_name for x in ['RAIFFEISEN', 'PORESKA', 'GBG', 'BIZ KONCEPT', 'BOŽIDAR']):
+        # Rule 4: Banks, taxes, suppliers = outgoing payments
+        elif any(x in cust_name for x in ['RAIFFEISEN', 'UNICREDIT', 'NLB', 'PORESKA', 'GBG', 'BIZ KONCEPT', 'BOŽIDAR']):
             is_incoming = False
         
-        # Rule 5: If both debit and credit are set, keep as is
+        # Rule 5: If both debit and credit are already set correctly, keep as is
         elif tx.get('debit', 0) > 0 and tx.get('credit', 0) > 0:
             fixed.append(tx)
             continue
@@ -511,8 +570,8 @@ col1, col2 = st.columns(2)
 with col1:
     st.markdown("### 📄 Izvodi banke")
     izvodi_files = st.file_uploader(
-        "Upload PDF izvoda",
-        type=['pdf', 'PDF'],
+        "Upload PDF ili XML izvoda",
+        type=['pdf', 'PDF', 'xml', 'XML'],
         accept_multiple_files=True,
         key='izvodi'
     )
@@ -571,13 +630,18 @@ if izvodi_files:
             try:
                 with st.status(f"Obradjujem: {izvod_file.name}"):
                     # Extract
-                    st.write("Citam PDF...")
+                    st.write("Citam fajl...")
                     pdf_bytes = izvod_file.read()
-                    text = extract_text_from_pdf(pdf_bytes)
                     
-                    # Parse
-                    st.write("AI parsiranje...")
-                    parsed = parse_with_claude(text, izvod_file.name)
+                    # Detect format: XML or PDF
+                    if izvod_file.name.lower().endswith('.xml'):
+                        st.write("Parsiram XML izvod...")
+                        parsed = parse_xml_izvod(pdf_bytes, izvod_file.name)
+                    else:
+                        # PDF format - extract and AI parse
+                        text = extract_text_from_pdf(pdf_bytes)
+                        st.write("AI parsiranje PDF izvoda...")
+                        parsed = parse_with_claude(text, izvod_file.name)
                     
                     # Expand BEX
                     st.write("Proveravam BEX...")
@@ -608,7 +672,8 @@ if izvodi_files:
                         'format': output_format,
                         'statement': parsed['statement'],
                         'tx_count': len(expanded),
-                        'bex_expanded': len(expanded) > original_count
+                        'bex_expanded': len(expanded) > original_count,
+                        'transactions': expanded  # Keep for display
                     })
                     
             except Exception as e:
@@ -640,6 +705,38 @@ if izvodi_files:
                         mime=r['mime_type'],
                         key=f"download_{r['filename']}_{r['format']}"
                     )
+                
+                # Display transactions for verification
+                with st.expander(f"📊 Pregledaj sve transakcije ({r['tx_count']})"):
+                    st.markdown("### Lista generisanih stavki:")
+                    
+                    # Create dataframe for better display
+                    import pandas as pd
+                    tx_data = []
+                    for i, tx in enumerate(r['transactions'], 1):
+                        tx_data.append({
+                            'Br': i,
+                            'Datum': tx.get('date', ''),
+                            'Kupac': tx.get('customer_name', '')[:40],
+                            'Duguje': f"{tx.get('debit', 0):,.2f}",
+                            'Potražuje': f"{tx.get('credit', 0):,.2f}",
+                            'Opis': tx.get('description', '')[:50]
+                        })
+                    
+                    df = pd.DataFrame(tx_data)
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    
+                    # Summary
+                    total_debit = sum(tx.get('debit', 0) for tx in r['transactions'])
+                    total_credit = sum(tx.get('credit', 0) for tx in r['transactions'])
+                    
+                    col_sum1, col_sum2, col_sum3 = st.columns(3)
+                    with col_sum1:
+                        st.metric("Ukupno Duguje", f"{total_debit:,.2f} RSD")
+                    with col_sum2:
+                        st.metric("Ukupno Potražuje", f"{total_credit:,.2f} RSD")
+                    with col_sum3:
+                        st.metric("Saldo", f"{total_credit - total_debit:,.2f} RSD")
             else:
                 st.error(f"GRESKA {r['filename']}: {r['error']}")
 
