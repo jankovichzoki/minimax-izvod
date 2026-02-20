@@ -184,14 +184,21 @@ Vrati SAMO JSON (bez markdown):
   ]
 }}
 
-PRAVILA:
-- Izvuci SVE kupce iz specifikacije
+KRITIČNO VAŽNA PRAVILA ZA IZNOSE:
+1. Iznos je u koloni "Iznos" u PDF-u
+2. Format iznosa u PDF-u: 11,400 ili 2,050 ili 23,093
+3. UKLONI SVE ZAREZE iz iznosa: 11,400 → 11400
+4. NIKAD ne dodavaj nule: ako piše 11,400 to je 11400 dinara, NE 114000!
+5. Ako iznos ima 2 decimale (11,40), zadrži ih: 11,40 → 1140
+6. Proveri: suma svih iznosa mora biti realna (ispod 1,000,000 RSD po specifikaciji)
+
+OSTALA PRAVILA:
 - posiljka = 9-cifreni broj pošiljke (Br.pošiljke kolona)
-- name = Ime i prezime uplatilca (Uplatilac kolona)
-- address = Adresa (Adresa kolona)
-- amount = Iznos u dinarima BEZ zareza (npr. 11400 umesto 11,400)
+- name = Ime i prezime uplatilca TAČNO kao što piše (VELIKA SLOVA)
+- address = Adresa TAČNO kao što piše
 - date = Datum naplate (D.naplate kolona) u formatu DD.MM.YYYY
-- NIKAD ne izmišljaj podatke, koristi SAMO ono što piše u specifikaciji"""
+- NIKAD ne izmišljaj podatke
+- Izvuci SVE redove iz tabele"""
             
             msg = client.messages.create(
                 model="claude-sonnet-4-20250514",
