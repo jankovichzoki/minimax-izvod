@@ -63,48 +63,53 @@ st.markdown('<p class="subtitle">PDF izvodi → Excel/XML sa razbijenim BEX kupc
 # ========================================================================
 def format_account_number(account_str):
     """
-    Konvertuje broj računa u srpski domaći format: XXX-XXXXXXXXXXXXX-XX
+    Konvertuje broj računa u srpski domaći format: XXX-XXXXXXXXXXXXX-XX (3-13-2).
     
-    Podržava:
-    - IBAN format: RS35170003002777200074 → 170-0030027772000-74
-    - Domaći sa crticama: 205-0000000422476-62 → vraća kao je
+    Minimax XML Partija atribut mora biti 18 cifara BEZ crtica.
+    Ova funkcija vraća formatiran string SA crticama - za XML koristiti .replace('-','').
+    
+    Podržava sve varijante ulaza:
+    - IBAN: RS35170003002777200074 → 170-0030027772000-74
+    - Domaći 3-13-2: 205-0000000422476-62 → vraća kao je
+    - Domaći 3-X-2 bez leading zeros: 170-30027772000-74 → 170-0030027772000-74 (KEY FIX)
     - 18 cifara bez crtica → 3-13-2 format
+    - 16 cifara bez crtica (domaći bez crtica i bez leading zeros) → dopuni na 18
     """
     s = str(account_str).strip()
     
-    # Već u ispravnom domaćem formatu (3-var-2 sa crticama)
-    if re.match(r'^\d{3}-\d{6,13}-\d{2}$', s):
+    # Već tačno 3-13-2 format
+    if re.match(r'^\d{3}-\d{13}-\d{2}$', s):
         return s
     
-    # IBAN format (RS + 2 check digits + 18 BBAN digits = RS35...)
-    upper = s.upper()
-    if upper.startswith('RS') and len(re.sub(r'\D', '', s)) >= 18:
-        bban = re.sub(r'\D', '', s)[4:]  # Ukloni 4 cifre (2 check + 2 numeričke od RS35)
-        # Tačnije: RS + 2 check = 4 znaka, ostatak su BBAN cifre
-        # IBAN = RS(2) + check(2) + BBAN(18) 
-        # Iz cifara: prvih 2 su check digits iz '35', ostalo je BBAN
-        all_digits = re.sub(r'\D', '', s)
-        if len(all_digits) == 20:  # RS(letters) + 2check + 18BBAN = 20 cifara u dijelu bez RS
-            # Zapravo: RS35 + 18 BBAN = RS(2 slova) + 35(2 cifre) + BBAN(18 cifre)
-            # all_digits = 35 + BBAN = 2 + 18 = 20 cifara
-            bban_digits = all_digits[2:]  # Preskočimo '35' (check digits)
-        elif len(all_digits) == 18:
-            bban_digits = all_digits  # Samo BBAN
-        else:
-            bban_digits = all_digits
-        
-        if len(bban_digits) == 18:
-            bank = bban_digits[:3]
-            mid = bban_digits[3:16]   # 13 cifara - ČUVAMO leading zeros!
-            check = bban_digits[16:]  # 2 cifre
-            return f'{bank}-{mid}-{check}'
+    # Domaći format 3-X-2 gde X ima MANJE od 13 cifara → dopuni sa leading zeros
+    m = re.match(r'^(\d{3})-(\d{1,12})-(\d{2})$', s)
+    if m:
+        bank, mid, check = m.group(1), m.group(2), m.group(3)
+        return f'{bank}-{mid.zfill(13)}-{check}'
     
-    # 18 cifara bez crtica (domaći BBAN direktno)
+    # IBAN format (počinje sa RS)
+    if s.upper().startswith('RS'):
+        all_digits = re.sub(r'\D', '', s)
+        # IBAN = RS(slova) + 2check_digits + 18_BBAN → cifre = check(2) + BBAN(18) = 20
+        bban_digits = all_digits[2:] if len(all_digits) == 20 else all_digits
+        if len(bban_digits) == 18:
+            return f'{bban_digits[:3]}-{bban_digits[3:16]}-{bban_digits[16:]}'
+    
     digits = re.sub(r'\D', '', s)
+    
+    # 18 cifara bez crtica - direktno formatuj
     if len(digits) == 18:
         return f'{digits[:3]}-{digits[3:16]}-{digits[16:]}'
     
-    # Ima crtice ali ne odgovara standardnom - vrati kao je
+    # 16 cifara bez crtica = domaći bez leading zeros i bez crtica
+    # npr: 1703002777200074 = 170 | 30027772000 (11) | 74 → dopuni srednji na 13
+    if len(digits) == 16:
+        bank = digits[:3]
+        mid = digits[3:14]   # 11 cifara bez leading zeros
+        check = digits[14:]  # 2 cifre
+        return f'{bank}-{mid.zfill(13)}-{check}'
+    
+    # Ima crtice u nekom drugom obliku - vrati kao je
     if '-' in s:
         return s
     
@@ -293,10 +298,10 @@ Vrati SAMO JSON (bez markdown):
 }}
 
 KLJUČNA PRAVILA ZA BROJ RAČUNA (account polje u statement):
-- Izvuci DOMAĆI broj računa koji piše u izvodu (npr. "Z.R. 170-30027772000-74" ili "205-0000000422476-62")
-- NEMOJ vraćati IBAN format (RS35...)
-- Format je uvek: 3cifre-střednji_deo-2cifre
-- Ako vidiš samo IBAN, konvertuj ga: ukloni "RS" i 2 check cifre, ostatak formatuj kao 3-13-2
+- PRIORITET 1: Ako dokument sadrži IBAN (počinje sa "RS" + 2 cifre, npr. "RS35170003007043900080"), vrati GA TAČNO, sve cifre
+- PRIORITET 2: Ako nema IBAN, vrati domaći broj TAČNO kao što piše, sa svim ciframa i crticama
+- IBAN je uvek precizniji od domaćeg formata - leading zeros su sigurno tačni u IBAN-u
+- NIKAD ne menjaj, ne skraćuj, ne zaokružuj cifre broja računa
 
 KLJUČNA PRAVILA ZA DEBIT/CREDIT:
 - CREDIT (potražuje) = novac ULAZI na račun = primanja, uplate od kupaca, kreditiranja
@@ -627,8 +632,11 @@ if izvodi_files:
             col1, col2 = st.columns([3, 1])
             with col1:
                 st.markdown(f"### ✅ {r['filename']}")
-                formatted_account = format_account_number(r['statement']['account'])
+                raw_account = r['statement']['account']
+                formatted_account = format_account_number(raw_account)
+                xml_account = formatted_account.replace('-', '')
                 st.markdown(f"**Račun:** `{formatted_account}`")
+                st.caption(f"🔍 Debug — Claude izvukao: `{raw_account}` → XML Partija: `{xml_account}` ({len(xml_account)} cifara)")
                 st.markdown(f"**Transakcija:** {r['tx_count']}" +
                           (f" _(BEX razbijen)_" if r['bex_expanded'] else ""))
             with col2:
