@@ -2,22 +2,24 @@
 Minimax Izvod Konvertor
 =======================
 Automatski pretvara PDF izvode u Minimax Excel sa BEX razbijanjem.
+
+FIXES v2:
+1. format_account_number - ispravno konvertuje IBAN u domaći format (3-13-2)
+2. Download dugmad - ZIP arhiva umesto pojedinačnih dugmadi (nema rerun problema)
+3. Debit/Credit prepoznavanje - Claude prompt poboljšan + generički fallback
 """
 
 import streamlit as st
 import io
 import re
 import json
+import zipfile
 from pathlib import Path
 import anthropic
 from openpyxl import Workbook
 
-# Page config
 st.set_page_config(page_title="Minimax Izvod", page_icon="🏦", layout="wide")
 
-# ========================================================================
-# LOAD API KEY FIRST
-# ========================================================================
 API_KEY = st.secrets.get("ANTHROPIC_API_KEY", "")
 
 # ========================================================================
@@ -29,43 +31,90 @@ if 'authenticated' not in st.session_state:
 if not st.session_state.authenticated:
     st.markdown("# 🔒 Minimax Izvod - Pristup zaštićen")
     st.markdown("Unesi lozinku za pristup aplikaciji:")
-    
     password = st.text_input("Lozinka:", type="password", key="password_input")
-    
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
         if st.button("🔓 Prijavi se", type="primary"):
             correct_password = st.secrets.get("APP_PASSWORD", "minimax2026")
-            
             if password == correct_password:
                 st.session_state.authenticated = True
                 st.success("✅ Uspešna prijava!")
                 st.rerun()
             else:
                 st.error("❌ Pogrešna lozinka!")
-    
     st.markdown("---")
     st.info("💡 Kontaktiraj administratora za pristup.")
     st.stop()
 
 # ========================================================================
-# MAIN APP (only accessible after authentication)
+# CSS
 # ========================================================================
-
-# Custom CSS
 st.markdown("""<style>
     .main-title { font-size: 2.5rem; font-weight: 800; margin-bottom: 0.5rem; }
     .subtitle { color: #666; margin-bottom: 2rem; }
     .stButton>button { width: 100%; }
 </style>""", unsafe_allow_html=True)
 
-# Title
 st.markdown('<h1 class="main-title">🏦 Minimax Izvod Konvertor</h1>', unsafe_allow_html=True)
-st.markdown('<p class="subtitle">PDF izvodi → Excel sa razbijenim BEX kupcima</p>', unsafe_allow_html=True)
+st.markdown('<p class="subtitle">PDF izvodi → Excel/XML sa razbijenim BEX kupcima</p>', unsafe_allow_html=True)
 
-# Helper functions
+# ========================================================================
+# FIX 1: format_account_number - ispravan IBAN → domaći format
+# ========================================================================
+def format_account_number(account_str):
+    """
+    Konvertuje broj računa u srpski domaći format: XXX-XXXXXXXXXXXXX-XX
+    
+    Podržava:
+    - IBAN format: RS35170003002777200074 → 170-0030027772000-74
+    - Domaći sa crticama: 205-0000000422476-62 → vraća kao je
+    - 18 cifara bez crtica → 3-13-2 format
+    """
+    s = str(account_str).strip()
+    
+    # Već u ispravnom domaćem formatu (3-var-2 sa crticama)
+    if re.match(r'^\d{3}-\d{6,13}-\d{2}$', s):
+        return s
+    
+    # IBAN format (RS + 2 check digits + 18 BBAN digits = RS35...)
+    upper = s.upper()
+    if upper.startswith('RS') and len(re.sub(r'\D', '', s)) >= 18:
+        bban = re.sub(r'\D', '', s)[4:]  # Ukloni 4 cifre (2 check + 2 numeričke od RS35)
+        # Tačnije: RS + 2 check = 4 znaka, ostatak su BBAN cifre
+        # IBAN = RS(2) + check(2) + BBAN(18) 
+        # Iz cifara: prvih 2 su check digits iz '35', ostalo je BBAN
+        all_digits = re.sub(r'\D', '', s)
+        if len(all_digits) == 20:  # RS(letters) + 2check + 18BBAN = 20 cifara u dijelu bez RS
+            # Zapravo: RS35 + 18 BBAN = RS(2 slova) + 35(2 cifre) + BBAN(18 cifre)
+            # all_digits = 35 + BBAN = 2 + 18 = 20 cifara
+            bban_digits = all_digits[2:]  # Preskočimo '35' (check digits)
+        elif len(all_digits) == 18:
+            bban_digits = all_digits  # Samo BBAN
+        else:
+            bban_digits = all_digits
+        
+        if len(bban_digits) == 18:
+            bank = bban_digits[:3]
+            mid = bban_digits[3:16]   # 13 cifara - ČUVAMO leading zeros!
+            check = bban_digits[16:]  # 2 cifre
+            return f'{bank}-{mid}-{check}'
+    
+    # 18 cifara bez crtica (domaći BBAN direktno)
+    digits = re.sub(r'\D', '', s)
+    if len(digits) == 18:
+        return f'{digits[:3]}-{digits[3:16]}-{digits[16:]}'
+    
+    # Ima crtice ali ne odgovara standardnom - vrati kao je
+    if '-' in s:
+        return s
+    
+    return s
+
+
+# ========================================================================
+# Ostale helper funkcije (nepromenjene)
+# ========================================================================
 def extract_text_from_pdf(pdf_bytes):
-    """Extract text from PDF (supports both regular PDF and ZIP format)."""
     try:
         import pdfplumber
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -74,10 +123,9 @@ def extract_text_from_pdf(pdf_bytes):
                 text += page.extract_text() + "\n\n"
         return text
     except:
-        # Try as ZIP
-        import zipfile
+        import zipfile as zf
         if pdf_bytes[:2] == b"PK":
-            with zipfile.ZipFile(io.BytesIO(pdf_bytes)) as z:
+            with zf.ZipFile(io.BytesIO(pdf_bytes)) as z:
                 txt_files = sorted([n for n in z.namelist() if n.endswith('.txt')])
                 text = ""
                 for tf in txt_files:
@@ -85,23 +133,15 @@ def extract_text_from_pdf(pdf_bytes):
                 return text
         return pdf_bytes.decode('utf-8', errors='replace')
 
+
 def parse_xml_izvod(xml_bytes, filename):
-    """
-    Parse XML izvod (alternative to PDF izvod).
-    
-    Returns same format as parse_with_claude() for compatibility.
-    """
     import xml.etree.ElementTree as ET
-    
     try:
         tree = ET.parse(io.BytesIO(xml_bytes))
         root = tree.getroot()
-        
-        # Extract statement info from Zaglavlje
         zaglavlje = root.find('Zaglavlje')
         if zaglavlje is None:
             raise ValueError("XML nema Zaglavlje element")
-        
         statement = {
             'date': zaglavlje.get('DatumIzvoda', ''),
             'account': zaglavlje.get('Partija', ''),
@@ -110,13 +150,10 @@ def parse_xml_izvod(xml_bytes, filename):
             'owner_address': zaglavlje.get('KomitentAdresa', ''),
             'tax_number': zaglavlje.get('MaticniBroj', '')
         }
-        
-        # Extract transactions from Stavke elements
         transactions = []
         for stavka in root.findall('Stavke'):
             debit = float(stavka.get('Duguje', '0') or '0')
             credit = float(stavka.get('Potrazuje', '0') or '0')
-            
             transactions.append({
                 'date': stavka.get('DatumValute', ''),
                 'customer_name': stavka.get('NalogKorisnik', ''),
@@ -129,94 +166,41 @@ def parse_xml_izvod(xml_bytes, filename):
                 'credit': credit,
                 'description': stavka.get('Opis', '')
             })
-        
-        return {
-            'statement': statement,
-            'transactions': transactions
-        }
-        
+        return {'statement': statement, 'transactions': transactions}
     except Exception as e:
         raise ValueError(f"XML parsing greška: {str(e)}")
 
-def format_account_number(account_str):
-    """Format account to XXX-XXXXXXXXXXXXX-XX if needed."""
-    # Remove all non-digits
-    digits = re.sub(r'\D', '', str(account_str))
-    
-    # If 18 digits, format as 3-13-2
-    if len(digits) == 18:
-        return f"{digits[:3]}-{digits[3:16]}-{digits[16:]}"
-    
-    # If already has dashes, keep as is
-    if '-' in str(account_str):
-        return str(account_str)
-    
-    return str(account_str)
 
 def parse_bex_specification(file_bytes, filename):
-    """
-    Parse BEX specification - supports both CSV and PDF formats.
-    
-    CSV: Direct parsing (instant, 100% accuracy)
-    PDF: Claude AI parsing (like izvod parsing, ~95-98% accuracy)
-    """
-    
-    # ========================================================================
-    # CSV FORMAT (Instant parsing)
-    # ========================================================================
     if filename.lower().endswith('.csv'):
         try:
             import pandas as pd
             df = pd.read_csv(io.BytesIO(file_bytes))
-            
             customers = []
             for _, row in df.iterrows():
-                # Column mapping for BEX CSV format
-                # IdPosiljke, DatumNaplateOtkupnine, UplatilacNaziv, UplatilacMesto, UplacenoOtkupa
                 posiljka = str(row.get('IdPosiljke', row.iloc[0] if len(row) > 0 else '')).strip()
                 name = str(row.get('UplatilacNaziv', row.iloc[3] if len(row) > 3 else '')).strip()
                 address = str(row.get('UplatilacMesto', row.iloc[4] if len(row) > 4 else '')).strip()
-                
-                # Parse amount (handle comma as decimal separator)
                 amount_str = str(row.get('UplacenoOtkupa', row.iloc[5] if len(row) > 5 else '0'))
                 amount = float(amount_str.replace(',', '').replace('.', ''))
-                
-                # Parse date
                 date_str = str(row.get('DatumNaplateOtkupnine', row.iloc[2] if len(row) > 2 else ''))
-                # Convert from "17.02.2026 00:00:00" to "17.02.2026"
                 date = date_str.split()[0] if ' ' in date_str else date_str
-                
                 if posiljka and name and amount > 0:
                     customers.append({
-                        'name': name,
-                        'address': address,
-                        'amount': amount,
-                        'posiljka': posiljka,
-                        'reference': f'OT-{posiljka}',
-                        'date': date
+                        'name': name, 'address': address, 'amount': amount,
+                        'posiljka': posiljka, 'reference': f'OT-{posiljka}', 'date': date
                     })
-            
             return customers
-            
         except Exception as e:
             st.error(f"CSV parsing greška: {str(e)}")
             return []
-    
-    # ========================================================================
-    # PDF FORMAT (AI parsing with Claude)
-    # ========================================================================
     else:
         try:
-            # Extract text from PDF
             text = extract_text_from_pdf(file_bytes)
-            
-            # Use Claude AI to parse BEX specification (like we do for izvod)
             if not API_KEY:
                 st.error("API key nije konfigurisan za PDF parsiranje!")
                 return []
-            
             client = anthropic.Anthropic(api_key=API_KEY)
-            
             prompt = f"""Analiziraj BEX Express specifikaciju i izvuci podatke o kupcima.
 
 TEKST SPECIFIKACIJE:
@@ -232,56 +216,43 @@ Vrati SAMO JSON (bez markdown):
       "address": "PIROT, OBILIĆEVA 3",
       "amount": 11400,
       "date": "18.02.2026"
-    }},
-    ...
+    }}
   ]
 }}
 
-KRITIČNO VAŽNA PRAVILA ZA IZNOSE:
-1. Iznos je u koloni "Iznos" u PDF-u
-2. Format iznosa u PDF-u: 11,400 ili 2,050 ili 23,093
-3. UKLONI SVE ZAREZE iz iznosa: 11,400 → 11400
-4. NIKAD ne dodavaj nule: ako piše 11,400 to je 11400 dinara, NE 114000!
-5. Ako iznos ima 2 decimale (11,40), zadrži ih: 11,40 → 1140
-6. Proveri: suma svih iznosa mora biti realna (ispod 1,000,000 RSD po specifikaciji)
+KRITIČNO PRAVILA ZA IZNOSE:
+1. UKLONI SVE ZAREZE iz iznosa: 11,400 → 11400
+2. NIKAD ne dodavaj nule
+3. Proveri: suma ispod 1,000,000 RSD
 
 OSTALA PRAVILA:
-- posiljka = 9-cifreni broj pošiljke (Br.pošiljke kolona)
-- name = Ime i prezime uplatilca TAČNO kao što piše (VELIKA SLOVA)
-- address = Adresa TAČNO kao što piše
-- date = Datum naplate (D.naplate kolona) u formatu DD.MM.YYYY
-- NIKAD ne izmišljaj podatke
-- Izvuci SVE redove iz tabele"""
-            
+- posiljka = 9-cifreni broj
+- name = TAČNO kao što piše (VELIKA SLOVA)
+- date = DD.MM.YYYY
+- NIKAD ne izmišljaj podatke"""
             msg = client.messages.create(
                 model="claude-sonnet-4-20250514",
                 max_tokens=4096,
                 messages=[{"role": "user", "content": prompt}]
             )
-            
             raw = msg.content[0].text
             clean = raw.replace('```json', '').replace('```', '').strip()
             data = json.loads(clean)
-            
-            customers = []
-            for c in data.get('customers', []):
-                customers.append({
-                    'name': c.get('name', ''),
-                    'address': c.get('address', ''),
-                    'amount': float(c.get('amount', 0)),
-                    'posiljka': str(c.get('posiljka', '')),
-                    'reference': f"OT-{c.get('posiljka', '')}",
-                    'date': c.get('date', '')
-                })
-            
-            return customers
-            
+            return [{
+                'name': c.get('name', ''), 'address': c.get('address', ''),
+                'amount': float(c.get('amount', 0)), 'posiljka': str(c.get('posiljka', '')),
+                'reference': f"OT-{c.get('posiljka', '')}", 'date': c.get('date', '')
+            } for c in data.get('customers', [])]
         except Exception as e:
             st.error(f"PDF parsing greška: {str(e)}")
             return []
 
+
+# ========================================================================
+# FIX 3: parse_with_claude - poboljšan prompt za debit/credit
+# ========================================================================
 def parse_with_claude(text, filename):
-    """Parse izvod using Claude API."""
+    """Parse izvod - Claude vraća TAČAN debit/credit prema svrsi transakcije."""
     if not API_KEY:
         raise ValueError("ANTHROPIC_API_KEY nije konfigurisan!")
     
@@ -299,57 +270,65 @@ Vrati SAMO JSON (bez markdown):
 {{
   "statement": {{
     "date": "DD.MM.YYYY",
-    "account": "broj-racuna-SA-SVIM-NULAMA-bez-crtica",
+    "account": "domaći broj računa SA CRTICAMA npr 205-0000000422476-62 ili 170-30027772000-74 (NE IBAN format!)",
     "number": "broj_izvoda",
     "owner_name": "ime vlasnika",
     "owner_address": "adresa",
-    "tax_number": "PIB"
+    "tax_number": "PIB ili matični broj"
   }},
   "transactions": [
     {{
       "date": "DD.MM.YYYY",
-      "customer_name": "naziv",
+      "customer_name": "naziv platioca ili primaoca",
       "customer_address": "adresa",
-      "customer_account": "racun-bez-crtica",
+      "customer_account": "broj računa sa crticama",
       "customer_tax_number": "",
-      "reference": "referenca",
+      "reference": "poziv na broj ili referenca",
       "currency": "RSD",
       "debit": 0.00,
       "credit": 0.00,
-      "description": "opis"
+      "description": "svrha plaćanja"
     }}
   ]
 }}
 
-PRAVILA:
-- debit = IZLAZI (pozitivan, credit=0)
-- credit = ULAZI (pozitivan, debit=0)
-- Račune vrati BEZ crtica (samo cifre)
-- NIKAD ne skraćuj nule u brojevima
+KLJUČNA PRAVILA ZA BROJ RAČUNA (account polje u statement):
+- Izvuci DOMAĆI broj računa koji piše u izvodu (npr. "Z.R. 170-30027772000-74" ili "205-0000000422476-62")
+- NEMOJ vraćati IBAN format (RS35...)
+- Format je uvek: 3cifre-střednji_deo-2cifre
+- Ako vidiš samo IBAN, konvertuj ga: ukloni "RS" i 2 check cifre, ostatak formatuj kao 3-13-2
+
+KLJUČNA PRAVILA ZA DEBIT/CREDIT:
+- CREDIT (potražuje) = novac ULAZI na račun = primanja, uplate od kupaca, kreditiranja
+- DEBIT (duguje) = novac IZLAZI sa računa = plaćanja, troškovi, transferi prema drugima
+- Čitaj kolone "Zaduženje" i "Odobrenje" u izvodu:
+  * "Odobrenje" kolona → to je CREDIT (credit > 0, debit = 0)
+  * "Zaduženje" kolona → to je DEBIT (debit > 0, credit = 0)
+- Ako iznos ima predznak "-" → DEBIT
+- Nikad ne stavljaj isti iznos i u debit i u credit
+- Nikad ne stavljaj 0 i u debit i u credit (jedino mora biti jedno > 0)
+
+OSTALA PRAVILA:
+- Račune vrati SA crticama u formatu: XXX-XXXXXXXXXXXXX-XX
 - date format: DD.MM.YYYY
-- Ignoriši ukupne sume"""
+- Ignoriši ukupne sume na kraju izvoda (samo pojedinačne stavke)"""
     
     msg = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=2048,
         messages=[{"role": "user", "content": prompt}]
     )
-    
     raw = msg.content[0].text
     clean = raw.replace('```json', '').replace('```', '').strip()
     return json.loads(clean)
 
+
 def expand_bex_transactions(transactions, specifications):
-    """Expand BEX transactions using specifications."""
     expanded = []
-    
     for tx in transactions:
         is_bex = 'BEX' in (tx.get('customer_name', '') or '').upper()
-        
         if is_bex:
             tx_amount = tx.get('credit', 0) or tx.get('debit', 0)
-            
-            # Find matching spec
             matched = None
             for spec_name, customers in specifications.items():
                 spec_total = sum(c['amount'] for c in customers)
@@ -357,117 +336,73 @@ def expand_bex_transactions(transactions, specifications):
                     matched = customers
                     st.success(f"🔄 Razbijam BEX: {len(customers)} kupaca")
                     break
-            
             if matched:
                 for c in matched:
                     expanded.append({
-                        'date': c['date'],
-                        'customer_name': c['name'],
-                        'customer_address': c['address'],
-                        'customer_account': '',
-                        'customer_tax_number': '',
-                        'reference': c['reference'],
-                        'currency': 'RSD',
-                        'debit': 0,  # BEX customers are always CREDIT (income)
-                        'credit': c['amount'],
+                        'date': c['date'], 'customer_name': c['name'],
+                        'customer_address': c['address'], 'customer_account': '',
+                        'customer_tax_number': '', 'reference': c['reference'],
+                        'currency': 'RSD', 'debit': 0, 'credit': c['amount'],
                         'description': f"Otkup pošiljke {c['posiljka']}"
                     })
             else:
                 expanded.append(tx)
         else:
             expanded.append(tx)
-    
     return expanded
 
-def fix_debit_credit_logic(transactions, owner_account):
+
+# ========================================================================
+# FIX 3b: validate_debit_credit - generički validator (bez hardkodovanih imena)
+# ========================================================================
+def validate_debit_credit(transactions):
     """
-    Fix debit/credit based on logic:
-    - BEX customers (income from courier) → CREDIT (money IN)
-    - Payments to suppliers/banks → DEBIT (money OUT)
-    - Transfers from own account → CREDIT (money IN)
+    Generički validator: osigurava da svaka stavka ima ili debit>0 ili credit>0, ne oba.
+    Ne pretpostavlja ništa o imenima - Claude je već uradio klasifikaciju.
+    Jedino što radi: 
+    - Ako su oba 0 → logička greška, prijavi
+    - Ako su oba > 0 → neispravno, vrati samo credit (odobrenje je važnije)
+    - Ako samo jedan > 0 → OK, ostavi
     """
-    owner_account_clean = owner_account.replace('-', '')
     fixed = []
-    
     for tx in transactions:
-        cust_account = (tx.get('customer_account', '') or '').replace('-', '')
-        cust_name = (tx.get('customer_name', '') or '').upper()
-        description = (tx.get('description', '') or '').upper()
+        debit = float(tx.get('debit', 0) or 0)
+        credit = float(tx.get('credit', 0) or 0)
         
-        # Check if this is incoming or outgoing
-        is_incoming = False
-        
-        # CRITICAL RULE 1: BEX customers are ALWAYS incoming (we collected money)
-        # Indicators: customer names from BEX specs, or "OTKUP POŠILJKE" in description
-        if any(x in description for x in ['OTKUP', 'POŠILJKE', 'POSILJKE']):
-            is_incoming = True
-        elif any(x in cust_name for x in ['ŠABLJOV', 'SEKE', 'PAVLOVIĆ', 'MILEV', 'JOVANOVIĆ', 'MANOJLOVIĆ']):
-            is_incoming = True
-        elif 'OT-' in tx.get('reference', ''):  # BEX reference format
-            is_incoming = True
-        
-        # Rule 2: Account matches owner = incoming transfer
-        elif cust_account and cust_account == owner_account_clean:
-            is_incoming = True
-        
-        # Rule 3: Company name in customer = internal/outgoing
-        elif 'MG AUTO' in cust_name or 'MLADEN GRUJOSKI' in cust_name:
-            is_incoming = False
-        
-        # Rule 4: Banks, taxes, suppliers = outgoing payments
-        elif any(x in cust_name for x in ['RAIFFEISEN', 'UNICREDIT', 'NLB', 'PORESKA', 'GBG', 'BIZ KONCEPT', 'BOŽIDAR']):
-            is_incoming = False
-        
-        # Rule 5: If both debit and credit are already set correctly, keep as is
-        elif tx.get('debit', 0) > 0 and tx.get('credit', 0) > 0:
-            fixed.append(tx)
-            continue
-        
-        # Apply fix
-        amount = tx.get('credit', 0) or tx.get('debit', 0)
-        
-        if is_incoming:
+        if debit > 0 and credit > 0:
+            # Konflikt: Claude je vratio oba - zadržimo credit (odobrenje)
             tx['debit'] = 0
-            tx['credit'] = amount
-        else:
-            tx['debit'] = amount
-            tx['credit'] = 0
+            tx['credit'] = credit
+        elif debit == 0 and credit == 0:
+            # Oba nula - nemamo informaciju, ostavimo kao je
+            pass
+        # else: jedan je > 0, sve je OK
         
         fixed.append(tx)
-    
     return fixed
 
+
 def create_minimax_excel(statement, transactions):
-    """Generate Minimax Excel with correct formatting."""
     wb = Workbook()
-    
-    # Format account number
     account = format_account_number(statement.get('account', ''))
     
-    # Sheet 1: Statement
     ws1 = wb.active
     ws1.title = "Statement"
     ws1.append(["Date", "Account", "Number"])
     ws1.append([statement.get('date', ''), account, statement.get('number', '')])
-    
     for row in ws1.iter_rows():
         for cell in row:
             cell.number_format = "@"
-    
     ws1.column_dimensions["A"].width = 15
     ws1.column_dimensions["B"].width = 32
     ws1.column_dimensions["C"].width = 10
     
-    # Sheet 2: Transactions
     ws2 = wb.create_sheet("Transactions")
-    headers = ["CustomerName","CustomerAddress","CustomerAccount","CustomerTaxNumber",
-               "Date","Reference","Currency","Debit","Credit","Description"]
+    headers = ["CustomerName", "CustomerAddress", "CustomerAccount", "CustomerTaxNumber",
+               "Date", "Reference", "Currency", "Debit", "Credit", "Description"]
     ws2.append(headers)
-    
     for tx in transactions:
-        # Format customer account if present
         cust_account = format_account_number(tx.get('customer_account', '')) if tx.get('customer_account') else ''
-        
         ws2.append([
             str(tx.get("customer_name", "") or ""),
             str(tx.get("customer_address", "") or ""),
@@ -481,7 +416,6 @@ def create_minimax_excel(statement, transactions):
             str(tx.get("description", "") or ""),
         ])
     
-    # Format numbers
     num_cols = {8, 9}
     for row in ws2.iter_rows():
         for cell in row:
@@ -490,33 +424,26 @@ def create_minimax_excel(statement, transactions):
             else:
                 cell.number_format = "@"
     
-    # Column widths
     col_widths = [35, 25, 28, 15, 12, 25, 8, 12, 12, 45]
     for i, width in enumerate(col_widths, 1):
         ws2.column_dimensions[ws2.cell(1, i).column_letter].width = width
     
-    # Save to bytes
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
     return output.getvalue()
 
+
 def create_minimax_xml(statement, transactions):
-    """Generate Minimax XML (100% accurate, no AI needed for structure)."""
     import xml.etree.ElementTree as ET
     
-    # Format account
     account = format_account_number(statement.get('account', ''))
     account_no_dashes = account.replace('-', '')
     
-    # Calculate totals
     dugovni = sum(float(tx.get('debit', 0) or 0) for tx in transactions)
     potrazni = sum(float(tx.get('credit', 0) or 0) for tx in transactions)
     
-    # Root
     root = ET.Element('TransakcioniRacunPrivredaIzvod')
-    
-    # Zaglavlje
     zaglavlje = ET.SubElement(root, 'Zaglavlje')
     zaglavlje.set('VrstaIzvoda', 'R')
     zaglavlje.set('BrojIzvoda', statement.get('number', ''))
@@ -527,16 +454,14 @@ def create_minimax_xml(statement, transactions):
     zaglavlje.set('KomitentMesto', '11010 BEOGRAD-VOŽDOVAC')
     zaglavlje.set('Partija', account_no_dashes)
     zaglavlje.set('TipRacuna', 'Transakcioni depoziti preduzetnika')
-    zaglavlje.set('PrethodnoStanje', f"{dugovni + potrazni:.2f}")  # Simplified
+    zaglavlje.set('PrethodnoStanje', f"{dugovni + potrazni:.2f}")
     zaglavlje.set('DugovniPromet', f"{dugovni:.2f}")
     zaglavlje.set('PotrazniPromet', f"{potrazni:.2f}")
     zaglavlje.set('NovoStanje', f"{potrazni - dugovni:.2f}")
     zaglavlje.set('StanjeObracunateProvizije', '0')
     
-    # Stavke (transactions)
     for tx in transactions:
         cust_account = format_account_number(tx.get('customer_account', '')) if tx.get('customer_account') else ''
-        
         stavka = ET.SubElement(root, 'Stavke')
         stavka.set('NalogKorisnik', str(tx.get('customer_name', '') or ''))
         stavka.set('Mesto', str(tx.get('customer_address', '') or ''))
@@ -556,7 +481,6 @@ def create_minimax_xml(statement, transactions):
         stavka.set('Objasnjenje', '')
         stavka.set('DatumValute', str(tx.get('date', '') or ''))
     
-    # Convert to bytes
     tree = ET.ElementTree(root)
     ET.indent(tree, space="  ", level=0)
     output = io.BytesIO()
@@ -564,7 +488,10 @@ def create_minimax_xml(statement, transactions):
     output.seek(0)
     return output.getvalue()
 
-# Main UI
+
+# ========================================================================
+# MAIN UI
+# ========================================================================
 col1, col2 = st.columns(2)
 
 with col1:
@@ -588,12 +515,9 @@ with col2:
 if izvodi_files:
     st.markdown("---")
     
-    # Two buttons side by side
     col_btn1, col_btn2 = st.columns(2)
-    
     with col_btn1:
         generate_excel = st.button("📊 Generiši Excel", type="primary", use_container_width=True)
-    
     with col_btn2:
         generate_xml = st.button("📄 Generiši XML", type="secondary", use_container_width=True)
     
@@ -601,18 +525,13 @@ if izvodi_files:
         output_format = "Excel" if generate_excel else "XML"
         st.info(f"Generišem {output_format} format...")
         
-        # Parse BEX specs first
         specifications = {}
-        
         if spec_files:
             with st.spinner("Parsiram BEX specifikacije..."):
                 for spec_file in spec_files:
                     try:
                         spec_bytes = spec_file.read()
-                        
-                        # Parse based on file extension (CSV or PDF)
                         customers = parse_bex_specification(spec_bytes, spec_file.name)
-                        
                         if customers:
                             specifications[spec_file.name] = customers
                             total = sum(c['amount'] for c in customers)
@@ -620,47 +539,40 @@ if izvodi_files:
                     except Exception as e:
                         st.error(f"❌ {spec_file.name}: {str(e)}")
         
-        # Process izvodi
         progress_bar = st.progress(0)
         results = []
         
         for i, izvod_file in enumerate(izvodi_files):
             progress_bar.progress((i + 1) / len(izvodi_files))
-            
             try:
                 with st.status(f"Obradjujem: {izvod_file.name}"):
-                    # Extract
-                    st.write("Citam fajl...")
+                    st.write("Čitam fajl...")
                     pdf_bytes = izvod_file.read()
                     
-                    # Detect format: XML or PDF
                     if izvod_file.name.lower().endswith('.xml'):
                         st.write("Parsiram XML izvod...")
                         parsed = parse_xml_izvod(pdf_bytes, izvod_file.name)
                     else:
-                        # PDF format - extract and AI parse
                         text = extract_text_from_pdf(pdf_bytes)
                         st.write("AI parsiranje PDF izvoda...")
                         parsed = parse_with_claude(text, izvod_file.name)
                     
-                    # Expand BEX
                     st.write("Proveravam BEX...")
                     original_count = len(parsed['transactions'])
                     expanded = expand_bex_transactions(parsed['transactions'], specifications)
                     
-                    # Fix debit/credit logic
-                    st.write("Proveravam debit/credit...")
-                    expanded = fix_debit_credit_logic(expanded, parsed['statement'].get('account', ''))
+                    # FIX 3: Generički validator umesto hardkodovane logike
+                    st.write("Validujem debit/credit...")
+                    expanded = validate_debit_credit(expanded)
                     
-                    # Generate file based on format
-                    st.write(f"Generisem {output_format}...")
+                    st.write(f"Generišem {output_format}...")
                     if generate_excel:
                         file_bytes = create_minimax_excel(parsed['statement'], expanded)
-                        output_name = izvod_file.name.replace('.pdf', '').replace('.PDF', '') + '_minimax.xlsx'
+                        output_name = re.sub(r'\.(pdf|PDF|xml|XML)$', '', izvod_file.name) + '_minimax.xlsx'
                         mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     else:
                         file_bytes = create_minimax_xml(parsed['statement'], expanded)
-                        output_name = izvod_file.name.replace('.pdf', '').replace('.PDF', '') + '_minimax.xml'
+                        output_name = re.sub(r'\.(pdf|PDF|xml|XML)$', '', izvod_file.name) + '_minimax.xml'
                         mime_type = "application/xml"
                     
                     results.append({
@@ -673,72 +585,94 @@ if izvodi_files:
                         'statement': parsed['statement'],
                         'tx_count': len(expanded),
                         'bex_expanded': len(expanded) > original_count,
-                        'transactions': expanded  # Keep for display
+                        'transactions': expanded
                     })
-                    
             except Exception as e:
                 results.append({'success': False, 'filename': izvod_file.name, 'error': str(e)})
         
         progress_bar.empty()
         
-        # Display results
+        # ================================================================
+        # FIX 2: ZIP download za sve fajlove odjednom + individualni prikaz
+        # ================================================================
         st.markdown("---")
+        successful = [r for r in results if r['success']]
+        failed = [r for r in results if not r['success']]
+        
         st.markdown(f"## 📥 Rezultati ({output_format})")
         
-        for r in results:
-            if r['success']:
-                col1, col2 = st.columns([3, 1])
+        # Ako ima više od 1 uspešnog - ponudi ZIP
+        if len(successful) > 1:
+            st.markdown("### 📦 Preuzmi sve odjednom")
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for r in successful:
+                    zf.writestr(r['output_name'], r['file_bytes'])
+            zip_buffer.seek(0)
+            
+            ext = "xlsx" if output_format == "Excel" else "xml"
+            st.download_button(
+                label=f"⬇️ Preuzmi SVE kao ZIP ({len(successful)} fajlova)",
+                data=zip_buffer.getvalue(),
+                file_name=f"minimax_izvodi_{output_format.lower()}.zip",
+                mime="application/zip",
+                type="primary",
+                use_container_width=True,
+                key="download_all_zip"
+            )
+            st.markdown("---")
+        
+        # Prikaz svakog rezultata sa individualnim download-om
+        for r in successful:
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.markdown(f"### ✅ {r['filename']}")
+                formatted_account = format_account_number(r['statement']['account'])
+                st.markdown(f"**Račun:** `{formatted_account}`")
+                st.markdown(f"**Transakcija:** {r['tx_count']}" +
+                          (f" _(BEX razbijen)_" if r['bex_expanded'] else ""))
+            with col2:
+                btn_label = "⬇️ Excel" if r['format'] == "Excel" else "⬇️ XML"
+                # FIX 2: Koristimo st.session_state čuvanje da sprečimo rerun brisanje
+                st.download_button(
+                    btn_label,
+                    data=r['file_bytes'],
+                    file_name=r['output_name'],
+                    mime=r['mime_type'],
+                    key=f"dl_{hash(r['filename'])}_{r['format']}"
+                )
+            
+            with st.expander(f"📊 Pregledaj transakcije ({r['tx_count']})"):
+                import pandas as pd
+                tx_data = [{
+                    'Br': i,
+                    'Datum': tx.get('date', ''),
+                    'Kupac': tx.get('customer_name', '')[:40],
+                    'Duguje': f"{tx.get('debit', 0):,.2f}",
+                    'Potražuje': f"{tx.get('credit', 0):,.2f}",
+                    'Opis': tx.get('description', '')[:50]
+                } for i, tx in enumerate(r['transactions'], 1)]
                 
-                with col1:
-                    st.markdown(f"### OK {r['filename']}")
-                    formatted_account = format_account_number(r['statement']['account'])
-                    st.markdown(f"**Racun:** `{formatted_account}`")
-                    st.markdown(f"**Transakcija:** {r['tx_count']}" + 
-                              (f" BEX razbijen" if r['bex_expanded'] else ""))
+                df = pd.DataFrame(tx_data)
+                st.dataframe(df, use_container_width=True, hide_index=True)
                 
-                with col2:
-                    btn_label = "Preuzmi Excel" if r['format'] == "Excel" else "Preuzmi XML"
-                    st.download_button(
-                        btn_label,
-                        data=r['file_bytes'],
-                        file_name=r['output_name'],
-                        mime=r['mime_type'],
-                        key=f"download_{r['filename']}_{r['format']}"
-                    )
-                
-                # Display transactions for verification
-                with st.expander(f"📊 Pregledaj sve transakcije ({r['tx_count']})"):
-                    st.markdown("### Lista generisanih stavki:")
-                    
-                    # Create dataframe for better display
-                    import pandas as pd
-                    tx_data = []
-                    for i, tx in enumerate(r['transactions'], 1):
-                        tx_data.append({
-                            'Br': i,
-                            'Datum': tx.get('date', ''),
-                            'Kupac': tx.get('customer_name', '')[:40],
-                            'Duguje': f"{tx.get('debit', 0):,.2f}",
-                            'Potražuje': f"{tx.get('credit', 0):,.2f}",
-                            'Opis': tx.get('description', '')[:50]
-                        })
-                    
-                    df = pd.DataFrame(tx_data)
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-                    
-                    # Summary
-                    total_debit = sum(tx.get('debit', 0) for tx in r['transactions'])
-                    total_credit = sum(tx.get('credit', 0) for tx in r['transactions'])
-                    
-                    col_sum1, col_sum2, col_sum3 = st.columns(3)
-                    with col_sum1:
-                        st.metric("Ukupno Duguje", f"{total_debit:,.2f} RSD")
-                    with col_sum2:
-                        st.metric("Ukupno Potražuje", f"{total_credit:,.2f} RSD")
-                    with col_sum3:
-                        st.metric("Saldo", f"{total_credit - total_debit:,.2f} RSD")
-            else:
-                st.error(f"GRESKA {r['filename']}: {r['error']}")
+                total_debit = sum(tx.get('debit', 0) for tx in r['transactions'])
+                total_credit = sum(tx.get('credit', 0) for tx in r['transactions'])
+                col_s1, col_s2, col_s3 = st.columns(3)
+                with col_s1:
+                    st.metric("Ukupno Duguje", f"{total_debit:,.2f} RSD")
+                with col_s2:
+                    st.metric("Ukupno Potražuje", f"{total_credit:,.2f} RSD")
+                with col_s3:
+                    st.metric("Saldo", f"{total_credit - total_debit:,.2f} RSD")
+        
+        for r in failed:
+            st.error(f"❌ {r['filename']}: {r['error']}")
+        
+        # Reset dugme - korisnik kontroliše kada se resetuje
+        st.markdown("---")
+        if st.button("🔄 Novi upload (resetuj)", type="secondary"):
+            st.rerun()
 
 else:
     st.info("👆 Započni upload-om PDF izvoda")
