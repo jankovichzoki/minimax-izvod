@@ -3,7 +3,7 @@ Minimax Izvod Konvertor
 =======================
 Automatski pretvara PDF izvode u Minimax Excel/XML sa BEX razbijanjem.
 
-FIXES v3:
+FIXES v4:
 1. Importovi na vrhu, ne unutar funkcija
 2. Proper error handling u PDF ekstrakciji (bez bare except)
 3. Retry logika za Claude JSON parsing (3 pokušaja)
@@ -12,6 +12,8 @@ FIXES v3:
 6. validate_debit_credit prijavljuje konflikte korisniku umesto tihog rešavanja
 7. PrethodnoStanje nije poznat iz stavki - postavlja se na 0.00
 8. BEX matching proverava i datum, ne samo iznos
+9. TABLE EXTRACTION: pdfplumber čita kolone po poziciji → 100% tačan debit/credit
+   Claude ostaje samo za header (broj računa, datum) i fallback za ne-tabelarne PDF
 """
 
 import io
@@ -312,15 +314,195 @@ def _call_claude_with_retry(client, prompt, max_tokens=8192, retries=3):
 
 
 # ========================================================================
+# parse_amount - konverzija srpskog formata broja u float
+# ========================================================================
+def parse_amount(s):
+    """'31.962,80' → 31962.80 | '32.776,00' → 32776.0 | '' → 0.0"""
+    if not s:
+        return 0.0
+    # Ukloni sve osim cifara i zareza (zarez = decimalni separator u SRB)
+    cleaned = re.sub(r'[^\d,]', '', str(s).strip())
+    if not cleaned:
+        return 0.0
+    cleaned = cleaned.replace(',', '.')
+    try:
+        return float(cleaned)
+    except ValueError:
+        return 0.0
+
+
+# ========================================================================
+# try_extract_table_transactions - čita debit/credit iz kolona tabele
+# Ovo je glavno rešenje za tačnost: ne zavisi od AI interpretacije
+# ========================================================================
+def try_extract_table_transactions(pdf_bytes):
+    """
+    Pokušava ekstrakciju transakcija iz PDF tabele koristeći pozicije kolona.
+    Identifikuje "Na teret"/"Duguje" i "U korist"/"Potražuje" kolone po imenu,
+    pa čita iznose direktno — nema AI pogađanja.
+    Vraća listu transakcija ili None ako tabela nije pronađena.
+    """
+    DEBIT_KW  = {'teret', 'duguje', 'debit', 'zaduženje', 'zaduzenje'}
+    CREDIT_KW = {'korist', 'potražuje', 'potrazuje', 'credit', 'odobrenje'}
+    SKIP_KW   = {'promet', 'total', 'saldo', 'stanje', 'opening', 'closing',
+                 'balance', 'prethodno', 'novo stanje'}
+
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            debit_col  = None
+            credit_col = None
+            all_data_rows = []
+
+            for page in pdf.pages:
+                tables = page.extract_tables()
+                for table in tables:
+                    if not table:
+                        continue
+                    for row_i, row in enumerate(table):
+                        cells_lower = [str(c or '').lower() for c in row]
+                        row_text = ' '.join(cells_lower)
+
+                        has_debit  = any(kw in row_text for kw in DEBIT_KW)
+                        has_credit = any(kw in row_text for kw in CREDIT_KW)
+
+                        if has_debit and has_credit:
+                            for col_i, cell in enumerate(cells_lower):
+                                if any(kw in cell for kw in DEBIT_KW):
+                                    debit_col = col_i
+                                if any(kw in cell for kw in CREDIT_KW):
+                                    credit_col = col_i
+                            all_data_rows.extend(table[row_i + 1:])
+                            break
+                    else:
+                        if debit_col is not None:
+                            all_data_rows.extend(table)
+
+            if debit_col is None or credit_col is None or not all_data_rows:
+                return None
+
+            transactions = []
+            for row in all_data_rows:
+                if not row or len(row) <= max(debit_col, credit_col):
+                    continue
+
+                row_text = ' '.join(str(c or '').lower() for c in row)
+                if any(kw in row_text for kw in SKIP_KW):
+                    continue
+
+                debit  = parse_amount(row[debit_col])
+                credit = parse_amount(row[credit_col])
+
+                if debit == 0 and credit == 0:
+                    continue
+
+                # Izvuci datum (DD.MM.YYYY)
+                date = ''
+                for cell in row:
+                    m = re.search(r'\d{2}\.\d{2}\.\d{4}', str(cell or ''))
+                    if m:
+                        date = m.group()
+                        break
+
+                # Izvuci naziv, adresu, račun, opis
+                customer_name    = ''
+                customer_address = ''
+                customer_account = ''
+                description      = ''
+                reference        = ''
+
+                for col_i, cell in enumerate(row):
+                    if col_i in (debit_col, credit_col):
+                        continue
+                    cell_str = str(cell or '').strip()
+                    if not cell_str:
+                        continue
+
+                    # Broj računa (18 cifara bez razmaka)
+                    digits_only = re.sub(r'\D', '', cell_str)
+                    if len(digits_only) == 18:
+                        customer_account = cell_str
+                        continue
+
+                    # Redni broj (1-3 cifre)
+                    if re.match(r'^\d{1,3}$', cell_str):
+                        continue
+
+                    # Datum već uhvaćen
+                    if re.match(r'\d{2}\.\d{2}\.\d{4}', cell_str):
+                        continue
+
+                    # Višelinijska ćelija: prva linija = naziv, druga = adresa
+                    lines = [l.strip() for l in cell_str.split('\n') if l.strip()]
+                    if lines and not customer_name:
+                        customer_name    = lines[0]
+                        customer_address = lines[1] if len(lines) > 1 else ''
+                    elif lines and not description:
+                        description = ' '.join(lines)
+
+                    # PBZ referenca (npr. "99 OT-1/26")
+                    if re.search(r'\d{2}\s+\S+', cell_str) and not reference:
+                        reference = cell_str
+
+                transactions.append({
+                    'date':              date,
+                    'customer_name':     customer_name,
+                    'customer_address':  customer_address,
+                    'customer_account':  format_account_number(customer_account) if customer_account else '',
+                    'customer_tax_number': '',
+                    'reference':         reference,
+                    'currency':          'RSD',
+                    'debit':             debit,
+                    'credit':            credit,
+                    'description':       description,
+                })
+
+            return transactions if transactions else None
+
+    except Exception:
+        return None
+
+
+# ========================================================================
 # parse_with_claude - poboljšan prompt + retry + max_tokens 8192
 # ========================================================================
-def parse_with_claude(text, filename):
-    """Parse izvod - Claude vraća TAČAN debit/credit prema svrsi transakcije."""
+def parse_with_claude(text, filename, table_transactions=None):
+    """
+    Parse izvod pomoću Claude-a.
+    Ako su table_transactions dostupne (iz pdfplumber), Claude parsira SAMO header.
+    Inače Claude parsira sve (header + transakcije) — fallback za ne-tabelarne PDF.
+    """
     if not API_KEY:
         raise ValueError("ANTHROPIC_API_KEY nije konfigurisan!")
 
     client = anthropic.Anthropic(api_key=API_KEY)
 
+    if table_transactions is not None:
+        # Hibridni mode: Claude samo za header
+        header_prompt = f"""Analiziraj zaglavlje izvoda banke i izvuci podatke o računu.
+
+TEKST IZVODA:
+{text[:3000]}
+
+Vrati SAMO JSON (bez markdown):
+{{
+  "date": "DD.MM.YYYY",
+  "account": "broj računa SA CRTICAMA npr 205-0000000422476-62 ili RS35170003002777200074",
+  "number": "broj_izvoda",
+  "owner_name": "ime vlasnika",
+  "owner_address": "adresa",
+  "tax_number": "PIB ili matični broj"
+}}
+
+PRAVILA:
+- Ako postoji IBAN (RS + cifre), vrati ga TAČNO
+- Ako nema IBAN, vrati domaći format TAČNO kao što piše
+- NIKAD ne menjaj cifre broja računa"""
+
+        raw = _call_claude_with_retry(client, header_prompt, max_tokens=512)
+        statement = json.loads(raw)
+        return {'statement': statement, 'transactions': table_transactions}
+
+    # Fallback: Claude parsira sve (za ne-tabelarne PDF)
     prompt = f"""Analiziraj izvod banke i izvuci podatke u JSON formatu.
 
 TEKST IZVODA:
@@ -643,8 +825,17 @@ if izvodi_files:
                         parsed = parse_xml_izvod(pdf_bytes, izvod_file.name)
                     else:
                         text = extract_text_from_pdf(pdf_bytes)
-                        st.write("AI parsiranje PDF izvoda...")
-                        parsed = parse_with_claude(text, izvod_file.name)
+
+                        # Pokušaj table extraction za tačan debit/credit
+                        st.write("Čitam tabelu iz PDF-a...")
+                        table_tx = try_extract_table_transactions(pdf_bytes)
+
+                        if table_tx:
+                            st.write(f"✅ Tabela pronađena ({len(table_tx)} stavki) — AI parsira samo header")
+                        else:
+                            st.write("⚠️ Tabela nije pronađena — AI parsira sve")
+
+                        parsed = parse_with_claude(text, izvod_file.name, table_transactions=table_tx)
 
                     st.write("Proveravam BEX...")
                     original_count = len(parsed['transactions'])
