@@ -236,7 +236,7 @@ OSTALA PRAVILA:
 - date = DD.MM.YYYY
 - NIKAD ne izmišljaj podatke"""
             msg = client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-sonnet-4-6",
                 max_tokens=4096,
                 messages=[{"role": "user", "content": prompt}]
             )
@@ -319,7 +319,7 @@ OSTALA PRAVILA:
 - Ignoriši ukupne sume na kraju izvoda (samo pojedinačne stavke)"""
     
     msg = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=2048,
         messages=[{"role": "user", "content": prompt}]
     )
