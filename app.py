@@ -153,6 +153,7 @@ def parse_xml_izvod(xml_bytes, filename):
             'number': zaglavlje.get('BrojIzvoda', ''),
             'owner_name': zaglavlje.get('KomitentNaziv', ''),
             'owner_address': zaglavlje.get('KomitentAdresa', ''),
+            'owner_place': zaglavlje.get('KomitentMesto', ''),
             'tax_number': zaglavlje.get('MaticniBroj', '')
         }
         transactions = []
@@ -176,6 +177,36 @@ def parse_xml_izvod(xml_bytes, filename):
         raise ValueError(f"XML parsing greška: {str(e)}")
 
 
+def parse_serbian_amount(amount_str):
+    """
+    Parsira iznos koji može biti u srpskom (1.234,56) ili engleskom (1,234.56) formatu,
+    ili bez separatora hiljada. Ne sme naivno da briše i tačku i zarez jer to gubi decimale
+    (npr. '11.400,50'.replace(',','').replace('.','') → '1140050' umesto 11400.50).
+    """
+    s = re.sub(r'[^\d,.\-]', '', str(amount_str).strip())
+    if not s:
+        return 0.0
+
+    if ',' in s and '.' in s:
+        # Poslednji separator u nizu je decimalni, prethodni su hiljade
+        if s.rfind(',') > s.rfind('.'):
+            s = s.replace('.', '').replace(',', '.')
+        else:
+            s = s.replace(',', '')
+    elif ',' in s:
+        # Samo zarez: 1-2 cifre posle → decimalni zarez, inače hiljadni separator
+        after = s.split(',')[-1]
+        s = s.replace(',', '.') if len(after) <= 2 else s.replace(',', '')
+    elif '.' in s:
+        # Samo tačka: tačno 3 cifre posle poslednje tačke → hiljadni separator (11.400 = 11400)
+        # 1-2 cifre → decimalna tačka (11.40 = 11.40)
+        after = s.split('.')[-1]
+        if len(after) == 3:
+            s = s.replace('.', '')
+
+    return float(s) if s not in ('', '-', '.') else 0.0
+
+
 def parse_bex_specification(file_bytes, filename):
     if filename.lower().endswith('.csv'):
         try:
@@ -187,7 +218,7 @@ def parse_bex_specification(file_bytes, filename):
                 name = str(row.get('UplatilacNaziv', row.iloc[3] if len(row) > 3 else '')).strip()
                 address = str(row.get('UplatilacMesto', row.iloc[4] if len(row) > 4 else '')).strip()
                 amount_str = str(row.get('UplacenoOtkupa', row.iloc[5] if len(row) > 5 else '0'))
-                amount = float(amount_str.replace(',', '').replace('.', ''))
+                amount = parse_serbian_amount(amount_str)
                 date_str = str(row.get('DatumNaplateOtkupnine', row.iloc[2] if len(row) > 2 else ''))
                 date = date_str.split()[0] if ' ' in date_str else date_str
                 if posiljka and name and amount > 0:
@@ -277,9 +308,10 @@ Vrati SAMO JSON (bez markdown):
     "date": "DD.MM.YYYY",
     "account": "domaći broj računa SA CRTICAMA npr 205-0000000422476-62 ili 170-30027772000-74 (NE IBAN format!)",
     "number": "broj_izvoda",
-    "owner_name": "ime vlasnika",
-    "owner_address": "adresa",
-    "tax_number": "PIB ili matični broj"
+    "owner_name": "ime vlasnika računa",
+    "owner_address": "ulica i broj vlasnika (bez mesta/grada)",
+    "owner_place": "poštanski broj i mesto/grad vlasnika, npr. '11010 BEOGRAD-VOŽDOVAC'",
+    "tax_number": "matični broj firme vlasnika računa (ne PIB kupca)"
   }},
   "transactions": [
     {{
@@ -328,20 +360,30 @@ OSTALA PRAVILA:
     return json.loads(clean)
 
 
-def expand_bex_transactions(transactions, specifications):
+def expand_bex_transactions(transactions, specifications, consumed):
+    """
+    consumed: set deljen preko svih izvoda u istom pokretanju - jednom upotrebljena
+    specifikacija se ne sme ponovo upariti sa drugom BEX transakcijom (čak i ako bi
+    slučajno imala isti ukupan iznos), inače dolazi do duplog razbijanja.
+    """
     expanded = []
     for tx in transactions:
         is_bex = 'BEX' in (tx.get('customer_name', '') or '').upper()
         if is_bex:
             tx_amount = tx.get('credit', 0) or tx.get('debit', 0)
             matched = None
+            matched_name = None
             for spec_name, customers in specifications.items():
+                if spec_name in consumed:
+                    continue
                 spec_total = sum(c['amount'] for c in customers)
                 if abs(spec_total - tx_amount) < 0.01:
                     matched = customers
-                    st.success(f"🔄 Razbijam BEX: {len(customers)} kupaca")
+                    matched_name = spec_name
                     break
             if matched:
+                consumed.add(matched_name)
+                st.success(f"🔄 Razbijam BEX: {matched_name} → {len(matched)} kupaca ({tx_amount:,.2f} RSD)")
                 for c in matched:
                     expanded.append({
                         'date': c['date'], 'customer_name': c['name'],
@@ -351,6 +393,8 @@ def expand_bex_transactions(transactions, specifications):
                         'description': f"Otkup pošiljke {c['posiljka']}"
                     })
             else:
+                st.warning(f"⚠️ BEX transakcija od {tx_amount:,.2f} RSD nema odgovarajuću specifikaciju "
+                           f"(proveri da li je upload-ovana specifikacija sa tim ukupnim iznosom) - ostavljena neraspakovana")
                 expanded.append(tx)
         else:
             expanded.append(tx)
@@ -453,10 +497,10 @@ def create_minimax_xml(statement, transactions):
     zaglavlje.set('VrstaIzvoda', 'R')
     zaglavlje.set('BrojIzvoda', statement.get('number', ''))
     zaglavlje.set('DatumIzvoda', statement.get('date', ''))
-    zaglavlje.set('MaticniBroj', '4167520394')
+    zaglavlje.set('MaticniBroj', statement.get('tax_number', '') or '')
     zaglavlje.set('KomitentNaziv', statement.get('owner_name', ''))
     zaglavlje.set('KomitentAdresa', statement.get('owner_address', ''))
-    zaglavlje.set('KomitentMesto', '11010 BEOGRAD-VOŽDOVAC')
+    zaglavlje.set('KomitentMesto', statement.get('owner_place', '') or '')
     zaglavlje.set('Partija', account_no_dashes)
     zaglavlje.set('TipRacuna', 'Transakcioni depoziti preduzetnika')
     zaglavlje.set('PrethodnoStanje', f"{dugovni + potrazni:.2f}")
@@ -546,7 +590,8 @@ if izvodi_files:
         
         progress_bar = st.progress(0)
         results = []
-        
+        consumed_specs = set()  # deljeno preko svih izvoda u ovom pokretanju
+
         for i, izvod_file in enumerate(izvodi_files):
             progress_bar.progress((i + 1) / len(izvodi_files))
             try:
@@ -564,7 +609,7 @@ if izvodi_files:
                     
                     st.write("Proveravam BEX...")
                     original_count = len(parsed['transactions'])
-                    expanded = expand_bex_transactions(parsed['transactions'], specifications)
+                    expanded = expand_bex_transactions(parsed['transactions'], specifications, consumed_specs)
                     
                     # FIX 3: Generički validator umesto hardkodovane logike
                     st.write("Validujem debit/credit...")
