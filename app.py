@@ -210,16 +210,29 @@ def parse_serbian_amount(amount_str):
 def parse_bex_specification(file_bytes, filename):
     if filename.lower().endswith('.csv'):
         try:
-            import pandas as pd
-            df = pd.read_csv(io.BytesIO(file_bytes))
+            import csv
+            text = file_bytes.decode('utf-8-sig', errors='replace')
+            # csv.reader ne baca gresku na nekonzistentan broj kolona po redu (za razliku
+            # od pandas C parsera) - bitno jer BEX izvoz zna da ubaci zarez bez navodnika
+            # u napomena kolone, sto pomeri broj polja u tom jednom redu.
+            rows = [r for r in csv.reader(io.StringIO(text)) if any(c.strip() for c in r)]
+            if not rows:
+                return []
+
+            header = [h.strip() for h in rows[0]]
+            col_idx = {name: i for i, name in enumerate(header) if name}
+
+            def field(row, col_name):
+                i = col_idx.get(col_name)
+                return row[i].strip() if i is not None and i < len(row) else ''
+
             customers = []
-            for _, row in df.iterrows():
-                posiljka = str(row.get('IdPosiljke', row.iloc[0] if len(row) > 0 else '')).strip()
-                name = str(row.get('UplatilacNaziv', row.iloc[3] if len(row) > 3 else '')).strip()
-                address = str(row.get('UplatilacMesto', row.iloc[4] if len(row) > 4 else '')).strip()
-                amount_str = str(row.get('UplacenoOtkupa', row.iloc[5] if len(row) > 5 else '0'))
-                amount = parse_serbian_amount(amount_str)
-                date_str = str(row.get('DatumNaplateOtkupnine', row.iloc[2] if len(row) > 2 else ''))
+            for row in rows[1:]:
+                posiljka = field(row, 'IdPosiljke')
+                name = field(row, 'UplatilacNaziv')
+                address = field(row, 'UplatilacMesto')
+                amount = parse_serbian_amount(field(row, 'UplacenoOtkupa') or '0')
+                date_str = field(row, 'DatumNaplateOtkupnine')
                 date = date_str.split()[0] if ' ' in date_str else date_str
                 if posiljka and name and amount > 0:
                     customers.append({
@@ -268,12 +281,17 @@ OSTALA PRAVILA:
 - NIKAD ne izmišljaj podatke"""
             msg = client.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=4096,
+                max_tokens=8192,
                 messages=[{"role": "user", "content": prompt}]
             )
             raw = msg.content[0].text
             clean = raw.replace('```json', '').replace('```', '').strip()
-            data = json.loads(clean)
+            try:
+                data = json.loads(clean)
+            except json.JSONDecodeError as e:
+                cut_off = msg.stop_reason == 'max_tokens'
+                hint = " (odgovor je odsečen - specifikacija je predugačka za trenutni limit)" if cut_off else ""
+                raise ValueError(f"Nevalidan JSON od Claude-a: {e}{hint}")
             return [{
                 'name': c.get('name', ''), 'address': c.get('address', ''),
                 'amount': float(c.get('amount', 0)), 'posiljka': str(c.get('posiljka', '')),
@@ -352,12 +370,17 @@ OSTALA PRAVILA:
     
     msg = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=2048,
+        max_tokens=8192,
         messages=[{"role": "user", "content": prompt}]
     )
     raw = msg.content[0].text
     clean = raw.replace('```json', '').replace('```', '').strip()
-    return json.loads(clean)
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError as e:
+        cut_off = msg.stop_reason == 'max_tokens'
+        hint = " (odgovor je odsečen jer je izvod predugačak za trenutni limit - javi administratoru)" if cut_off else ""
+        raise ValueError(f"Claude je vratio nevalidan JSON za {filename}: {e}{hint}")
 
 
 def expand_bex_transactions(transactions, specifications, consumed):
